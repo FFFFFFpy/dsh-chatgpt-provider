@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "ChatGPT 供应商",
+    "description": "通过 Sign in with ChatGPT 把 ChatGPT 添加为模型供应商。在设置页的 ChatGPT 分区登录一次完成本机授权，之后在输入框的模型菜单中选择账号可用的模型，请求走 ChatGPT 套餐而不是 API Key。",
+    "detail": "docs/DETAIL.md"
+  }
+}

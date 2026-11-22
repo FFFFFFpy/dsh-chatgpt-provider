@@ -1,0 +1,8 @@
+# Bundle patch layer: one Host row loads this package's main entry as a Cordis
+# plugin. The host entry registers the `chatgpt` provider route, its Responses
+# adapter, the Sign in with ChatGPT flow, and the settings page's JSON API; the
+# package's `dsh.client` manifest serves the browser half for that page.
+- insert:
+    - id: chatgpt-provider
+      name: '@local/chatgpt-provider'
+      config: {}

@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "ChatGPT provider",
+    "description": "Adds ChatGPT as a model provider through Sign in with ChatGPT. Sign in on the ChatGPT settings page to authorize this host once, then pick any model your account offers in the composer's model menu; requests stream through the ChatGPT plan instead of an API key.",
+    "detail": "docs/DETAIL.md"
+  }
+}
