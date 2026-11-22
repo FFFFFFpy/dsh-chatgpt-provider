@@ -8,10 +8,7 @@
 /** Provider route a request selects with `GenerateOptions.provider`. */
 export const PROVIDER = 'chatgpt'
 
-/** Settings namespace this adapter family owns for configuration surfaces. */
-export const SETTINGS_NS = 'llm-chatgpt'
-
-/** Credential-record key holding this plugin's single ChatGPT account. */
+/** Credential record containing the registrations for the official deployment. */
 export const RECORD_KEY = 'chatgpt-provider/default'
 
 /** Identity scopes plus the ChatGPT-plan permission the flow requests. */

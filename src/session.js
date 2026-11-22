@@ -1,13 +1,15 @@
 /**
- * One ChatGPT account's durable connection plus the derived state configuration
- * surfaces and the adapter read.
+ * Saved ChatGPT registrations and the active connection used by the settings
+ * page and the model adapter.
  *
  * The credential store is the only writer: the sign-in flow and the refresher
  * both commit through `modifyRecord`, so a rotation is durable before it is
  * used and a second process cannot race a rotating refresh token.
  */
 import { randomUUID } from 'node:crypto'
-import { API_PREFIX, PLAN_SCOPE, RECORD_KEY } from './constants.js'
+import { API_PREFIX } from './constants.js'
+import { ChatGPTAuth } from './oauth.js'
+import { ProfileStore, putProfile, withoutCredentials } from './profiles.js'
 import { ChatGptError, CODES, apiError, requiresSignIn } from './errors.js'
 
 /** The stable host-id record, kept apart from the account grant. */
@@ -40,7 +42,7 @@ function normalizeModel(entry) {
   if (entry === null || typeof entry !== 'object') return undefined
   const slug = entry.slug ?? entry.id
   if (typeof slug !== 'string' || slug.trim() === '' || slug.length > 200) return undefined
-  if (entry.visibility !== undefined && entry.visibility !== 'list') return undefined
+  if (entry.visibility !== 'list') return undefined
   const display = entry.display_name ?? entry.displayName ?? entry.name
   const name = typeof display === 'string' && display.trim() !== '' ? display.slice(0, 200) : slug
   const contextWindow = Number(entry.context_window ?? entry.contextWindow)
@@ -57,9 +59,18 @@ function normalizeModel(entry) {
   }
 }
 
-/**
- * The live ChatGPT connection for this deployment.
- */
+const activeProfile = state => state.profiles.find(profile => profile.clientId === state.activeId)
+const hasPlan = profile => ChatGPTAuth.planUsageGranted(profile.scopes)
+const sharingDisabled = () => new ChatGptError('sharing_not_enabled', 'Enable ChatGPT plan usage in Settings > ChatGPT.')
+
+/** Replace the previous token set together, including optional expiry and ID-token fields. */
+function applyRotation(profile, rotation) {
+  const { pendingRefresh, earliestRefreshAt, ...prior } = profile
+  const { receivedAt, idToken, ...fields } = rotation
+  return { ...prior, ...fields, ...(idToken ? { idToken } : {}), savedAt: new Date().toISOString() }
+}
+
+/** The live ChatGPT connection for this deployment. */
 export class ChatGptSession {
   /**
    * @param {object} options - session options.
@@ -75,42 +86,24 @@ export class ChatGptSession {
     this.logger = logger
     this.attempt = undefined
     this.lastSignInError = undefined
-    this.refreshPromise = undefined
-    this.catalog = { key: undefined, fetchedAt: 0, models: [], error: undefined }
+    this.profiles = new ProfileStore(ctx.credentials, auth.authBaseURL, auth.apiBaseURL)
+    this.key = this.profiles.key
+    this.requests = new AbortController()
+    this.catalog = { key: undefined, fetchedAt: 0, models: [] }
     this.hostIdPromise = undefined
+    this.disconnecting = false
   }
 
-  /** @returns {import('@deepseek-ai/dsh-credentials').CredentialKey} the account record address. */
-  get key() {
-    return RECORD_KEY
-  }
-
-  /**
-   * Read the stored connection.
-   * @returns {Promise<Record<string, unknown> | undefined>} the payload, or undefined.
-   */
+  /** The selected session ends on sign-out. Its reusable registration stays in the profile store. */
   async read() {
-    const record = await this.ctx.credentials.readRecord(this.key)
-    const payload = record?.kind === 'grant' ? record.payload : undefined
-    return payload !== null && typeof payload === 'object' ? payload : undefined
+    const selected = activeProfile(await this.profiles.read())
+    return selected?.status === 'disconnected' ? undefined : selected
   }
 
-  /**
-   * Commit a payload as this plugin's grant record.
-   * @param {Record<string, unknown>} payload - owner-defined JSON.
-   * @returns {Promise<void>} resolves once durable.
-   */
-  async write(payload) {
-    await this.ctx.credentials.modifyRecord(this.key, async () => ({ kind: 'grant', payload }))
-  }
-
-  /**
-   * Delete the stored grant.
-   * @returns {Promise<void>} resolves once removed.
-   */
-  async clear() {
-    await this.ctx.credentials.deleteRecord(this.key)
-    this.catalog = { key: undefined, fetchedAt: 0, models: [], error: undefined }
+  resetRequests() {
+    this.requests.abort()
+    this.requests = new AbortController()
+    this.catalog = { key: undefined, fetchedAt: 0, models: [] }
   }
 
   /**
@@ -138,233 +131,217 @@ export class ChatGptSession {
     return this.hostIdPromise
   }
 
-  /**
-   * Start one sign-in attempt.
-   * @returns {Promise<{ url: string, browserOpened: boolean, done: Promise<{ ok: true } | { ok: false, error: { code: string, message: string } }> }>} the authorization URL, whether a browser was launched, and the attempt's settlement.
-   */
-  async beginSignIn() {
-    if (this.attempt !== undefined) {
-      throw new ChatGptError('already_running', 'A ChatGPT sign-in is already waiting for the browser.')
-    }
+  async beginSignIn({ clientId, newProfile = false, reconsent = false, signal } = {}) {
+    if (this.attempt || this.disconnecting) throw new ChatGptError('already_running', 'A ChatGPT connection change is already in progress.')
     const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), this.config.signInTimeoutMs)
-    const attempt = { controller, url: undefined, error: undefined, settled: false, resolveDone: undefined }
-    const done = new Promise(resolve => {
-      attempt.resolveDone = resolve
-    })
+    const attemptSignal = signal ? AbortSignal.any([controller.signal, signal]) : controller.signal
+    const timer = setTimeout(() => controller.abort(), this.config.signInTimeoutMs)
+    const attempt = { controller, url: undefined }
     this.attempt = attempt
     this.lastSignInError = undefined
-    const settle = value => {
-      attempt.settled = true
-      clearTimeout(timeout)
-      if (this.attempt === attempt) this.attempt = undefined
+    const finish = error => {
+      clearTimeout(timer)
       controller.abort()
-      attempt.resolveDone(value)
+      if (this.attempt === attempt) this.attempt = undefined
+      if (!error) return { ok: true }
+      if (attemptSignal.aborted && error.name === 'AbortError') error = new ChatGptError(CODES.cancelled, 'Sign-in was cancelled.')
+      const detail = { code: error.code ?? 'unknown', message: error.message, ...(error.requestId ? { requestId: error.requestId } : {}) }
+      if (detail.code !== CODES.cancelled) this.lastSignInError = detail
+      return { ok: false, error: detail }
     }
     try {
-      const previous = await this.read()
-      const hostId = await this.hostId()
+      const saved = await this.profiles.read()
+      const id = clientId ?? saved.activeId
+      const previous = newProfile ? undefined : saved.profiles.find(entry => entry.clientId === id) ??
+        (!id && saved.profiles.length === 1 ? saved.profiles[0] : undefined)
+      if (clientId && !previous) throw new ChatGptError('profile_not_found', 'Select a saved ChatGPT account.')
+      const hostId = previous?.extAgentHostId ?? await this.hostId()
       const started = await this.auth.beginAuthorization({
-        previous,
-        hostId,
-        signal: controller.signal,
-        onRegistration: async clientId => {
-          // Persist the issued registration before the one-time code is
-          // exchanged, so a failed exchange does not register a second app.
-          await this.write({
-            ...previous ?? {},
-            version: 1,
-            extAgentHostId: hostId,
-            clientId,
-            ...typeof previous?.subject === 'string' ? { subject: previous.subject } : {},
-            status: 'reauth_required',
-            savedAt: new Date().toISOString(),
+        previous, hostId, signal: attemptSignal, reconsent,
+        onRegistration: async issued => {
+          if (previous) return
+          await this.profiles.edit(state => {
+            attemptSignal.throwIfAborted()
+            if (state.profiles.some(entry => entry.clientId === issued)) {
+              throw new ChatGptError('profile_exists', 'This registration is already saved. Select its account to continue.')
+            }
+            putProfile(state, withoutCredentials({ clientId: issued, extAgentHostId: hostId }, 'registration_pending'))
+            state.activeId ??= issued
+            return true
           })
         },
       })
       attempt.url = started.url
-      void started.completion
-        .then(async connection => {
-          await this.write(connection)
-          this.catalog = { key: undefined, fetchedAt: 0, models: [], error: undefined }
-          this.lastSignInError = undefined
-          this.logger?.info?.('chatgpt: signed in')
-          settle({ ok: true })
+      const done = started.completion.then(async connection => {
+        await this.profiles.edit(state => {
+          attemptSignal.throwIfAborted()
+          const current = state.profiles.find(entry => entry.clientId === connection.clientId)
+          if (!current || (previous && current.savedAt !== previous.savedAt)) {
+            throw new ChatGptError('connection_changed', 'The ChatGPT connection changed during sign-in. Try again.')
+          }
+          putProfile(state, connection)
+          state.activeId = connection.clientId
+          return true
         })
-        .catch(error => {
-          const failure = error instanceof ChatGptError ? error : new ChatGptError('unknown', error instanceof Error ? error.message : String(error))
-          attempt.error = { code: failure.code, message: failure.message }
-          this.lastSignInError = attempt.error
-          if (failure.code !== CODES.cancelled) this.logger?.warn?.(`chatgpt: sign-in failed (${failure.code}): ${failure.message}`)
-          settle({ ok: false, error: attempt.error })
-        })
+        this.resetRequests()
+        return finish()
+      }).catch(finish)
       return { url: started.url, browserOpened: started.browserOpened, done }
     } catch (error) {
-      const failure = error instanceof ChatGptError ? error : new ChatGptError('unknown', error instanceof Error ? error.message : String(error))
-      this.lastSignInError = { code: failure.code, message: failure.message }
-      settle({ ok: false, error: this.lastSignInError })
+      finish(error)
       throw error
     }
   }
 
-  /**
-   * Wait for the running sign-in attempt, when there is one.
-   * @param {AbortSignal} [signal] - caller cancellation.
-   * @returns {Promise<{ ok: true } | { ok: false, error: { code: string, message: string } }>} the settlement.
-   */
-  async waitForSignIn(signal) {
-    const attempt = this.attempt
-    if (attempt === undefined) {
-      const connection = await this.read()
-      if (connection?.status === 'connected') return { ok: true }
-      return { ok: false, error: this.lastSignInError ?? { code: CODES.cancelled, message: 'No ChatGPT sign-in is running.' } }
-    }
-    const done = new Promise(resolve => {
-      const previous = attempt.resolveDone
-      attempt.resolveDone = value => {
-        previous(value)
-        resolve(value)
-      }
-    })
-    if (signal === undefined) return done
-    return await Promise.race([
-      done,
-      new Promise((_resolve, reject) => {
-        if (signal.aborted) {
-          reject(new ChatGptError(CODES.cancelled, 'Sign-in was cancelled.'))
-          return
-        }
-        signal.addEventListener('abort', () => reject(new ChatGptError(CODES.cancelled, 'Sign-in was cancelled.')), { once: true })
-      }),
-    ])
-  }
-
-  /**
-   * Withdraw a running sign-in attempt.
-   * @returns {boolean} whether an attempt was running.
-   */
   cancelSignIn() {
-    const attempt = this.attempt
-    if (attempt === undefined) return false
-    attempt.controller.abort()
+    if (!this.attempt) return false
+    this.attempt.controller.abort()
     return true
   }
 
-  /**
-   * Sign out: revoke the renewable session when possible, then forget it.
-   * @returns {Promise<{ revoked: 'revoked' | 'unconfirmed' }>} the revocation outcome.
-   */
+  async selectProfile(clientId) {
+    if (this.attempt || this.disconnecting) throw new ChatGptError('already_running', 'Finish the current connection change first.')
+    await this.profiles.edit(state => {
+      const profile = state.profiles.find(entry => entry.clientId === clientId)
+      if (profile?.status !== 'connected') throw new ChatGptError(CODES.not_signed_in, 'Sign in to this account to use it.')
+      state.activeId = clientId
+      return true
+    })
+    this.lastSignInError = undefined
+    this.resetRequests()
+  }
+
+  async acknowledgePlan(clientId) {
+    await this.profiles.edit(state => {
+      const profile = activeProfile(state)
+      if (!profile || profile.clientId !== clientId || !hasPlan(profile) || state.welcomedSubjects.includes(profile.subject)) return false
+      state.welcomedSubjects.push(profile.subject)
+      return true
+    })
+  }
+
   async signOut() {
+    if (this.disconnecting) throw new ChatGptError('already_running', 'Sign-out is already in progress.')
+    this.disconnecting = true
     this.cancelSignIn()
-    const connection = await this.read()
-    let revoked = 'unconfirmed'
-    if (connection !== undefined) {
-      revoked = await this.auth.revoke({ connection })
-      if (revoked !== 'revoked') {
-        this.logger?.warn?.('chatgpt: local credentials removed, remote revocation unconfirmed')
-      }
-    }
-    await this.clear()
-    return { revoked }
-  }
-
-  /**
-   * Refresh the stored grant, serializing concurrent refreshes.
-   * @param {AbortSignal} [signal] - caller cancellation.
-   * @returns {Promise<Record<string, unknown>>} the refreshed connection.
-   */
-  refresh(signal) {
-    this.refreshPromise ??= (async () => {
-      const connection = await this.read()
-      if (connection === undefined || typeof connection.refreshToken !== 'string') {
-        throw new ChatGptError(CODES.not_signed_in, 'ChatGPT is not signed in. Open Settings > ChatGPT and sign in.')
-      }
-      let refreshed
-      try {
-        refreshed = await this.auth.refresh({
-          connection,
-          signal: signal ?? new AbortController().signal,
-          persistRotation: async checkpoint => {
-            await this.write(checkpoint)
-          },
-        })
-      } catch (error) {
-        if (requiresSignIn(error)) {
-          await this.write({ ...connection, status: 'reauth_required', savedAt: new Date().toISOString() })
+    this.resetRequests()
+    let revoked = 'no-session'
+    try {
+      const selected = await this.read()
+      if (selected) await this.profiles.edit(async state => {
+        const profile = state.profiles.find(entry => entry.clientId === selected.clientId)
+        if (!profile || profile.status === 'disconnected') return false
+        try {
+          revoked = await this.auth.revoke({ connection: profile })
+        } catch {
+          revoked = 'unconfirmed'
         }
-        throw error
-      }
-      await this.write(refreshed)
-      this.catalog = { key: undefined, fetchedAt: 0, models: [], error: undefined }
-      return refreshed
-    })().finally(() => {
-      this.refreshPromise = undefined
-    })
-    return this.refreshPromise
-  }
-
-  /**
-   * Resolve a usable access token, refreshing near expiry.
-   * @param {AbortSignal} [signal] - caller cancellation.
-   * @returns {Promise<string>} bearer token.
-   */
-  async accessToken(signal) {
-    const connection = await this.read()
-    if (connection === undefined) {
-      throw new ChatGptError(CODES.not_signed_in, 'ChatGPT is not signed in. Open Settings > ChatGPT and sign in.')
-    }
-    if (connection.status === 'reauth_required') {
-      throw new ChatGptError(CODES.not_signed_in, 'The ChatGPT connection has expired. Sign in again in Settings > ChatGPT.')
-    }
-    const expiresAt = Number(connection.expiresAt)
-    if (!Number.isFinite(expiresAt) || expiresAt - REFRESH_SKEW_MS > Date.now()) {
-      if (typeof connection.accessToken === 'string' && connection.accessToken !== '') return connection.accessToken
-    }
-    try {
-      const refreshed = await this.refresh(signal)
-      if (typeof refreshed.accessToken !== 'string' || refreshed.accessToken === '') {
-        throw new ChatGptError(CODES.not_signed_in, 'ChatGPT is not signed in. Open Settings > ChatGPT and sign in.')
-      }
-      return refreshed.accessToken
-    } catch (error) {
-      // A still-valid token survives a failed refresh attempt.
-      if (typeof connection.accessToken === 'string' && Number.isFinite(expiresAt) && expiresAt > Date.now()) {
-        this.logger?.warn?.('chatgpt: refresh failed while the access token is still valid; using it')
-        return connection.accessToken
-      }
-      throw error
+        putProfile(state, withoutCredentials(profile, 'disconnected'))
+        return true
+      })
+      this.lastSignInError = undefined
+      return { revoked }
+    } finally {
+      this.disconnecting = false
     }
   }
 
-  /**
-   * Fetch through the account, retrying once after a 401.
-   * @param {string} url - absolute URL.
-   * @param {RequestInit} init - fetch options without authorization.
-   * @param {AbortSignal} [signal] - caller cancellation.
-   * @returns {Promise<Response>} the provider response.
-   */
-  async authorizedFetch(url, init, signal) {
-    let token = await this.accessToken(signal)
-    const once = async bearer => fetch(url, {
-      ...init,
-      headers: { ...init.headers, authorization: `Bearer ${bearer}` },
-      redirect: 'error',
-      ...signal === undefined ? {} : { signal },
+  /** Exchange and checkpoint under the host's writer lock. A separate commit promotes a verified rotation. */
+  async refresh(signal, { expected, automatic = false } = {}) {
+    expected ??= await this.read()
+    signal?.throwIfAborted()
+    const selected = state => {
+      const profile = activeProfile(state)
+      if (this.disconnecting || !profile || profile.status !== 'connected' || profile.clientId !== expected?.clientId) {
+        throw new ChatGptError(CODES.not_signed_in, 'The selected ChatGPT account is no longer connected.')
+      }
+      return profile
+    }
+    let failure
+    const invalidate = (state, profile, error) => {
+      if (!requiresSignIn(error) && ![CODES.account_mismatch, CODES.invalid_id_token, CODES.invalid_token_response].includes(error.code)) throw error
+      putProfile(state, withoutCredentials(profile, 'reauth_required'))
+      failure = new ChatGptError(CODES.not_signed_in, `The ChatGPT connection can no longer be used (${error.code}). Sign in again.`, {
+        cause: error, requestId: error.requestId, status: error.status,
+      })
+      return true
+    }
+    let saved = await this.profiles.edit(async state => {
+      const current = selected(state)
+      if (current.pendingRefresh || current.refreshToken !== expected.refreshToken) return false
+      if (automatic && current.expiresAt > Date.now() + REFRESH_SKEW_MS) return false
+      if (!current.refreshToken) {
+        if (hasPlan(current) && !(current.expiresAt > Date.now())) {
+          return invalidate(state, current, new ChatGptError('invalid_grant', 'The non-renewable ChatGPT access has expired.'))
+        }
+        throw new ChatGptError('refresh_unavailable', 'This ChatGPT registration has no renewable access.')
+      }
+      const earliest = typeof current.earliestRefreshAt === 'number' ? current.earliestRefreshAt * 1000 : Date.parse(current.earliestRefreshAt)
+      if (Date.now() < earliest) {
+        if (automatic && current.expiresAt > Date.now()) return false
+        throw new ChatGptError('refresh_not_ready', 'ChatGPT has not opened the refresh window yet.', { retryable: true })
+      }
+      let rotation
+      try {
+        signal?.throwIfAborted()
+        rotation = await this.auth.refresh({ connection: current, signal: AbortSignal.timeout(45_000) })
+      } catch (error) {
+        if (automatic && error.retryable && !requiresSignIn(error) && current.expiresAt > Date.now()) return false
+        return invalidate(state, current, error)
+      }
+      putProfile(state, rotation.idToken ? { ...current, pendingRefresh: rotation } : applyRotation(current, rotation))
+      return true
     })
-    let response
+    if (failure) throw failure
+    if (selected(saved).pendingRefresh) {
+      saved = await this.profiles.edit(async state => {
+        const current = selected(state)
+        if (!current.pendingRefresh) return false
+        try {
+          const identity = await this.auth.verifyRotation(current, current.pendingRefresh, AbortSignal.timeout(30_000))
+          putProfile(state, { ...applyRotation(current, current.pendingRefresh), ...identity })
+          return true
+        } catch (error) {
+          return invalidate(state, current, error)
+        }
+      })
+    }
+    if (failure) throw failure
+    signal?.throwIfAborted()
+    return selected(saved)
+  }
+
+  async accessToken(signal, expectedId) {
+    let profile = await this.read()
+    if (this.disconnecting || !profile || profile.status !== 'connected' || (expectedId && profile.clientId !== expectedId)) {
+      throw new ChatGptError(CODES.not_signed_in, 'Sign in to the selected account in Settings > ChatGPT.')
+    }
+    if (!hasPlan(profile)) throw sharingDisabled()
+    const renewBy = Date.now() + (profile.refreshToken ? REFRESH_SKEW_MS : 0)
+    if (profile.pendingRefresh || !(profile.expiresAt > renewBy)) {
+      profile = await this.refresh(signal, { expected: profile, automatic: true })
+    }
+    if (!hasPlan(profile)) throw sharingDisabled()
+    if (!profile.accessToken || !(profile.expiresAt > Date.now())) {
+      throw new ChatGptError('refresh_not_ready', 'The ChatGPT token has expired. Retry to renew it.', { retryable: true })
+    }
+    signal?.throwIfAborted()
+    return profile.accessToken
+  }
+
+  async authorizedFetch(url, init, signal, expectedId) {
+    const root = this.auth.apiBaseURL
+    if (url !== root + '/models' && url !== root + '/responses') {
+      throw new ChatGptError(CODES.configuration, 'The request does not belong to the selected ChatGPT resource.')
+    }
+    signal = signal ? AbortSignal.any([signal, this.requests.signal]) : this.requests.signal
+    const token = await this.accessToken(signal, expectedId)
     try {
-      response = await once(token)
+      return await fetch(url, { ...init, headers: { ...init.headers, authorization: 'Bearer ' + token }, redirect: 'error', signal })
     } catch (error) {
-      if (signal?.aborted === true) throw error
-      throw new ChatGptError(CODES.network_error, 'Could not reach ChatGPT. Check your connection and try again.', { retryable: true, cause: error })
+      if (signal.aborted) throw signal.reason
+      throw new ChatGptError(CODES.network_error, 'Could not reach ChatGPT. Try again.', { retryable: true, cause: error })
     }
-    if (response.status !== 401) return response
-    await response.body?.cancel().catch(() => undefined)
-    token = (await this.refresh(signal)).accessToken
-    if (typeof token !== 'string' || token === '') {
-      throw new ChatGptError(CODES.not_signed_in, 'ChatGPT is not signed in. Open Settings > ChatGPT and sign in.')
-    }
-    return once(token)
   }
 
   /**
@@ -373,8 +350,12 @@ export class ChatGptSession {
    * @returns {Promise<Array<{ id: string, name: string, contextWindow?: number, maxTokens?: number, reasoningEfforts?: string[] }>>} advertised models.
    */
   async listModels({ force = false, signal } = {}) {
+    const connection = await this.read()
+    if (connection?.status !== 'connected') throw new ChatGptError(CODES.not_signed_in, 'Sign in to ChatGPT to list models.')
+    if (!hasPlan(connection)) throw sharingDisabled()
     const configured = Array.isArray(this.config.models) ? this.config.models : []
     if (configured.length > 0) {
+      await this.accessToken(signal, connection.clientId)
       return configured.map(entry => ({
         id: entry.id,
         name: entry.name ?? entry.id,
@@ -383,12 +364,11 @@ export class ChatGptSession {
         ...Array.isArray(entry.reasoningEfforts) && entry.reasoningEfforts.length > 0 ? { reasoningEfforts: entry.reasoningEfforts } : {},
       }))
     }
-    const connection = await this.read()
-    const cacheKey = connection === undefined ? 'anonymous' : `${connection.clientId}:${connection.subject}`
+    const cacheKey = connection.clientId + ':' + connection.savedAt
     const fresh = this.catalog.key === cacheKey && Date.now() - this.catalog.fetchedAt < this.config.modelCacheSeconds * 1000
-    if (!force && fresh && this.catalog.models.length > 0) return this.catalog.models
+    if (!force && fresh && !connection.pendingRefresh && connection.expiresAt > Date.now() + REFRESH_SKEW_MS) return this.catalog.models
     try {
-      const response = await this.authorizedFetch(`${this.config.apiBaseURL}/models`, { headers: { accept: 'application/json' } }, signal)
+      const response = await this.authorizedFetch(this.auth.apiBaseURL + '/models', { headers: { accept: 'application/json' } }, signal ?? AbortSignal.timeout(30_000), connection.clientId)
       const body = await jsonBody(response)
       if (!response.ok) throw apiError(body, response.status, response.headers.get('x-request-id'))
       const list = body !== null && typeof body === 'object' && Array.isArray(body.models)
@@ -410,9 +390,12 @@ export class ChatGptSession {
     } catch (error) {
       const failure = error instanceof ChatGptError ? error : new ChatGptError('unknown', error instanceof Error ? error.message : String(error))
       this.catalog = { ...this.catalog, error: { code: failure.code, message: failure.message } }
-      if (this.catalog.models.length > 0 && this.catalog.key === cacheKey) {
-        this.logger?.warn?.('chatgpt: model listing failed; serving the cached catalog')
-        return this.catalog.models
+      if (failure.retryable && this.catalog.key === cacheKey && this.catalog.models.length > 0) {
+        const latest = await this.read()
+        if (latest?.clientId === connection.clientId && latest.savedAt === connection.savedAt && !latest.pendingRefresh) {
+          this.logger?.warn?.('chatgpt: model listing failed; serving the cached catalog')
+          return this.catalog.models
+        }
       }
       throw failure
     }
@@ -427,7 +410,7 @@ export class ChatGptSession {
   async resolveModel(model) {
     const configured = (Array.isArray(this.config.models) ? this.config.models : []).find(entry => entry.id === model)
     const listed = configured === undefined
-      ? (this.catalog.models.find(entry => entry.id === model) ?? (await this.listModels().catch(() => [])).find(entry => entry.id === model))
+      ? (await this.listModels().catch(() => [])).find(entry => entry.id === model)
       : undefined
     const chosen = configured ?? listed
     const efforts = chosen?.reasoningEfforts
@@ -441,78 +424,41 @@ export class ChatGptSession {
     }
   }
 
-  /**
-   * The configuration surface's view of this connection. Safe to send to a
-   * renderer: no token, id token, or refresh token crosses this boundary.
-   * @param {{ models?: boolean }} [options] - whether to include the catalog.
-   * @returns {Promise<Record<string, unknown>>} view state.
-   */
   async state({ models = true } = {}) {
-    const connection = await this.read()
+    const saved = await this.profiles.read()
+    const connection = activeProfile(saved)
     const attempt = this.attempt
-    const base = {
-      provider: 'chatgpt',
-      endpoint: this.config.apiBaseURL,
-      settingsRoute: `${API_PREFIX}/state`,
-    }
-    if (connection === undefined && attempt === undefined) {
-      return {
-        ...base,
-        status: 'signed-out',
-        signedIn: false,
-        account: null,
-        plan: null,
-        ...this.lastSignInError === undefined ? {} : { error: this.lastSignInError },
-      }
-    }
-    if (connection?.status === 'reauth_required') {
-      return {
-        ...base,
-        status: 'reauth-required',
-        signedIn: false,
-        account: { email: connection.email ?? null, name: connection.name ?? null },
-        plan: { sharing: Array.isArray(connection.scopes) && connection.scopes.includes(PLAN_SCOPE) },
-        error: { code: 'reauth_required', message: 'The ChatGPT connection expired. Sign in again.' },
-      }
-    }
-    const scopes = Array.isArray(connection?.scopes) ? connection.scopes : []
+    const signedIn = connection?.status === 'connected'
+    const sharing = signedIn && hasPlan(connection)
     const result = {
-      ...base,
-      status: attempt === undefined ? 'signed-in' : 'pending',
-      signedIn: connection !== undefined,
-      account: { email: connection?.email ?? null, name: connection?.name ?? null },
-      plan: { sharing: scopes.includes(PLAN_SCOPE) },
-      expiresAt: Number.isFinite(connection?.expiresAt) ? new Date(Number(connection.expiresAt)).toISOString() : null,
-      savedAt: typeof connection?.savedAt === 'string' ? connection.savedAt : null,
-      ...attempt?.url === undefined ? {} : { pendingUrl: attempt.url },
-      ...attempt?.error === undefined ? {} : { error: attempt.error },
+      provider: 'chatgpt', endpoint: this.auth.apiBaseURL, settingsRoute: API_PREFIX + '/state',
+      status: attempt ? 'pending' : signedIn ? 'signed-in' : connection?.status === 'reauth_required' ? 'reauth-required' : 'signed-out',
+      signedIn, activeId: saved.activeId, renewable: !!(signedIn && connection.refreshToken),
+      account: connection ? { name: connection.name ?? null, email: connection.email ?? null } : null,
+      plan: connection ? { sharing } : null,
+      welcome: !!(sharing && !connection.pendingRefresh && !saved.welcomedSubjects.includes(connection.subject)),
+      profiles: saved.profiles.map(({ clientId, email, name, status }, index) => ({ clientId, email, name, status, number: index + 1 })),
+      expiresAt: Number.isFinite(connection?.expiresAt) ? new Date(connection.expiresAt).toISOString() : null,
+      savedAt: connection?.savedAt ?? null,
+      ...attempt?.url ? { pendingUrl: attempt.url } : {},
+      ...this.lastSignInError ? { error: this.lastSignInError } : {},
     }
-    if (models) {
-      try {
-        result.models = (await this.listModels()).map(model => ({
-          id: model.id,
-          name: model.name,
-          ...Number.isFinite(model.contextWindow) ? { contextWindow: model.contextWindow } : {},
-        }))
-      } catch (error) {
-        const failure = error instanceof ChatGptError ? error : new ChatGptError('unknown', String(error))
-        result.models = []
-        result.modelsError = { code: failure.code, message: failure.message }
-        if (requiresSignIn(failure)) {
-          result.status = 'reauth-required'
-          result.signedIn = false
-          result.error = { code: failure.code, message: failure.message }
-        }
-      }
+    if (!models || attempt || !sharing) return result
+    let catalog = []
+    let modelsError
+    try {
+      catalog = (await this.listModels()).map(({ id, name, contextWindow }) => ({ id, name, contextWindow }))
+    } catch (error) {
+      modelsError = { code: error.code ?? 'unknown', message: error.message, ...(error.requestId ? { requestId: error.requestId } : {}) }
     }
-    return result
+    // Refresh or a switch during discovery can change which account, scope and expiry the page should show.
+    const latest = await this.state({ models: false })
+    if (latest.activeId !== saved.activeId || latest.status === 'pending') return latest
+    return { ...latest, models: latest.plan?.sharing ? catalog : [], ...(modelsError ? { modelsError } : {}) }
   }
 
-  /**
-   * Dispose process-level state owned by the session.
-   * @returns {void}
-   */
   dispose() {
     this.cancelSignIn()
+    this.resetRequests()
   }
 }

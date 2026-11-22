@@ -13,9 +13,32 @@ import { createHash, randomBytes, timingSafeEqual } from 'node:crypto'
 import { createServer } from 'node:http'
 import { spawn } from 'node:child_process'
 import { setTimeout as delay } from 'node:timers/promises'
-import { CALLBACK_PATH, DYNAMIC_CLIENT_ID, PLAN_SCOPE, RESOURCE, SCOPES } from './constants.js'
+import { CALLBACK_PATH, DYNAMIC_CLIENT_ID, ISSUER, PLAN_SCOPE, RESOURCE, SCOPES } from './constants.js'
 import { ChatGptError, CODES, apiError, errorShape } from './errors.js'
 import { verifyIdToken } from './jwt.js'
+
+/** Production grants and local development grants belong to separate deployments. */
+export function resolveEndpoints(authBaseURL = ISSUER, apiBaseURL = RESOURCE) {
+  const roots = [authBaseURL, apiBaseURL].map((value, index) => {
+    const label = index === 0 ? 'authBaseURL' : 'apiBaseURL'
+    let parsed
+    try {
+      parsed = new URL(value)
+    } catch {
+      throw new ChatGptError(CODES.configuration, label + ' must be an absolute http(s) URL.')
+    }
+    if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password || parsed.search || parsed.hash) {
+      throw new ChatGptError(CODES.configuration, label + ' must be an HTTP(S) endpoint without credentials, a query or a fragment.')
+    }
+    return parsed
+  })
+  const [issuer, resource] = roots.map(url => url.href.replace(/\/+$/, ''))
+  const official = issuer === ISSUER && resource === RESOURCE
+  if (!official && !roots.every(url => ['127.0.0.1', '[::1]', 'localhost'].includes(url.hostname))) {
+    throw new ChatGptError(CODES.configuration, 'Use the official OpenAI endpoints or a pair of local loopback endpoints.')
+  }
+  return { authBaseURL: issuer, apiBaseURL: resource }
+}
 
 /** Fresh random base64url value for one attempt's state, nonce, or PKCE verifier. */
 const randomValue = () => randomBytes(32).toString('base64url')
@@ -228,11 +251,10 @@ export class ChatGPTAuth {
    * @param {{ info?: Function, warn?: Function, debug?: Function }} [options.logger] - safe diagnostics.
    */
   constructor({ authBaseURL, apiBaseURL, redirectPort, appName, sendHostId, browserCommand, openBrowser, logger }) {
-    this.authBaseURL = authBaseURL
-    this.apiBaseURL = apiBaseURL
+    Object.assign(this, resolveEndpoints(authBaseURL, apiBaseURL))
     this.redirectPort = redirectPort
     this.appName = appName
-    this.sendHostId = sendHostId
+    this.sendHostId = this.authBaseURL === ISSUER || sendHostId !== false
     this.browserCommand = browserCommand
     this.openBrowser = openBrowser ?? (url => openSystemBrowser(url, browserCommand))
     this.logger = logger
@@ -315,9 +337,8 @@ export class ChatGPTAuth {
     })
     if (this.sendHostId) params.set('ext_agent_host_id', hostId)
     if (previous?.clientId === undefined) params.set('agent_name_hint', this.appName)
-    // Hints only; the verified subject check below binds the saved profile.
+    // The same URL is exposed for manual sign-in. Bind the profile by verified subject on return.
     if (typeof previous?.email === 'string' && previous.email !== '') params.set('login_hint', previous.email)
-    if (typeof previous?.idToken === 'string' && previous.idToken !== '') params.set('id_token_hint', previous.idToken)
     if (reconsent) params.set('prompt', 'consent')
     authorization.search = params.toString()
 
@@ -391,20 +412,15 @@ export class ChatGPTAuth {
     if (subject !== undefined && identity.subject !== subject) {
       throw new ChatGptError(CODES.account_mismatch, 'This sign-in returned a different ChatGPT account. Sign in with the original account.')
     }
-    const fields = this.tokenFields(data, { requireRefresh: true })
+    const fields = this.tokenFields(data)
     return {
-      version: 1,
       extAgentHostId: hostId,
       clientId,
       subject: identity.subject,
       ...identity.name === undefined ? {} : { name: identity.name },
       ...identity.email === undefined ? {} : { email: identity.email },
       idToken: data.id_token,
-      scopes: fields.scopes,
-      accessToken: fields.accessToken,
-      ...fields.refreshToken === undefined ? {} : { refreshToken: fields.refreshToken },
-      expiresAt: fields.expiresAt,
-      ...fields.earliestRefreshAt === undefined ? {} : { earliestRefreshAt: fields.earliestRefreshAt },
+      ...fields,
       status: 'connected',
       savedAt: new Date().toISOString(),
     }
@@ -414,21 +430,22 @@ export class ChatGPTAuth {
    * Normalize a token response.
    * @param {Record<string, unknown>} data - token endpoint body.
    * @param {{ requireRefresh?: boolean }} [options] - whether a refresh token is mandatory.
-   * @returns {{ scopes: string[], accessToken: string, refreshToken?: string, expiresAt: number, earliestRefreshAt?: string | number }} normalized fields.
+   * @returns {{ scopes: string[], accessToken?: string, refreshToken?: string, expiresAt?: number, earliestRefreshAt?: string | number }} normalized fields.
    */
   tokenFields(data, { requireRefresh = false } = {}) {
     const scope = typeof data.scope === 'string' ? data.scope : undefined
-    if (scope === undefined && requireRefresh) {
+    if (scope === undefined) {
       throw new ChatGptError(CODES.invalid_token_response, 'ChatGPT did not confirm the granted permissions. Please sign in again.')
     }
-    const scopes = (scope ?? '').split(/\s+/).filter(Boolean)
+    const scopes = scope.split(/\s+/).filter(Boolean)
     const accessToken = data.access_token
     if (typeof accessToken !== 'string' || accessToken === '') {
+      if (!requireRefresh && !scopes.includes('offline_access') && !scopes.includes(PLAN_SCOPE)) return { scopes }
       throw new ChatGptError(CODES.invalid_token_response, 'ChatGPT did not return the requested credentials. Please sign in again.')
     }
     const tokenType = typeof data.token_type === 'string' ? data.token_type.toLowerCase() : ''
     const expiresIn = data.expires_in
-    if (tokenType !== 'bearer' || typeof expiresIn !== 'number' || !Number.isFinite(expiresIn) || expiresIn <= 0) {
+    if (tokenType !== 'bearer' || typeof expiresIn !== 'number' || !Number.isFinite(Date.now() + expiresIn * 1000) || expiresIn <= 0) {
       throw new ChatGptError(CODES.invalid_token_response, 'ChatGPT returned incomplete credentials. Please sign in again.')
     }
     const refreshToken = typeof data.refresh_token === 'string' && data.refresh_token !== '' ? data.refresh_token : undefined
@@ -450,10 +467,9 @@ export class ChatGPTAuth {
    * @param {object} request - refresh request.
    * @param {Record<string, unknown>} request.connection - stored connection; never mutated.
    * @param {AbortSignal} request.signal - caller cancellation.
-   * @param {(checkpoint: Record<string, unknown>) => Promise<void>} [request.persistRotation] - persist a rotated token before verification.
-   * @returns {Promise<Record<string, unknown>>} the refreshed connection shape.
+   * @returns {Promise<Record<string, unknown>>} replacement fields, to checkpoint before verifying a returned ID token.
    */
-  async refresh({ connection, signal, persistRotation }) {
+  async refresh({ connection, signal }) {
     const provider = await this.discovery(signal)
     const refreshToken = connection.refreshToken
     if (typeof refreshToken !== 'string' || refreshToken === '') {
@@ -475,46 +491,33 @@ export class ChatGPTAuth {
     if (data === null || typeof data !== 'object') {
       throw new ChatGptError(CODES.invalid_token_response, 'ChatGPT returned an invalid token response. Please sign in again.')
     }
-    // OAuth may omit `scope` on refresh when the grant is unchanged.
-    const fields = this.tokenFields(
-      typeof data.scope === 'string' ? data : { ...data, scope: Array.isArray(connection.scopes) ? connection.scopes.join(' ') : SCOPES },
-      { requireRefresh: true },
-    )
-    const idToken = typeof data.id_token === 'string' && data.id_token !== '' ? data.id_token : undefined
-    const rotation = {
-      ...connection,
-      scopes: fields.scopes,
-      accessToken: fields.accessToken,
-      ...fields.refreshToken === undefined ? {} : { refreshToken: fields.refreshToken },
-      expiresAt: fields.expiresAt,
-      ...fields.earliestRefreshAt === undefined ? {} : { earliestRefreshAt: fields.earliestRefreshAt },
-      ...idToken === undefined ? {} : { idToken },
-      status: 'connected',
-      savedAt: new Date().toISOString(),
+    const fields = this.tokenFields({
+      ...data,
+      scope: data.scope === undefined ? connection.scopes.join(' ') : data.scope,
+    }, { requireRefresh: true })
+    if (data.id_token !== undefined && (typeof data.id_token !== 'string' || !data.id_token)) {
+      throw new ChatGptError(CODES.invalid_id_token, 'ChatGPT returned an invalid refreshed identity.')
     }
-    if (idToken !== undefined) {
-      // Persist the rotation before key retrieval can fail: a rotating refresh
-      // token must not be lost with the process.
-      await persistRotation?.({ ...rotation, pendingVerification: true })
-      const identity = await verifyIdToken({
-        idToken,
-        issuer: this.authBaseURL,
-        clientId: String(connection.clientId),
-        jwksUri: provider.jwks_uri,
-        receivedAt: Date.now(),
-        signal,
-      })
-      if (identity.subject !== connection.subject) {
-        throw new ChatGptError(CODES.account_mismatch, 'The refreshed ChatGPT identity does not match this profile. Sign in again.')
-      }
-      const { pendingVerification: _pending, ...verified } = rotation
-      return {
-        ...verified,
-        ...identity.name === undefined ? {} : { name: identity.name },
-        ...identity.email === undefined ? {} : { email: identity.email },
-      }
+    return { ...fields, ...(data.id_token ? { idToken: data.id_token } : {}), receivedAt: Date.now() }
+  }
+
+  async verifyRotation(connection, rotation, signal) {
+    const provider = await this.discovery(signal)
+    const identity = await verifyIdToken({
+      idToken: rotation.idToken,
+      issuer: this.authBaseURL,
+      clientId: connection.clientId,
+      jwksUri: provider.jwks_uri,
+      receivedAt: rotation.receivedAt,
+      signal,
+    })
+    if (identity.subject !== connection.subject) {
+      throw new ChatGptError(CODES.account_mismatch, 'The refreshed ChatGPT identity does not match this profile. Sign in again.')
     }
-    return rotation
+    return {
+      ...(identity.name ? { name: identity.name } : {}),
+      ...(identity.email ? { email: identity.email } : {}),
+    }
   }
 
   /**
@@ -522,11 +525,11 @@ export class ChatGPTAuth {
    * @param {object} request - revocation request.
    * @param {Record<string, unknown>} request.connection - stored connection.
    * @param {AbortSignal} [request.signal] - caller cancellation.
-   * @returns {Promise<'revoked' | 'unconfirmed'>} the outcome; never throws for a network failure.
+   * @returns {Promise<'revoked' | 'unconfirmed' | 'no-session'>} the revocation outcome.
    */
   async revoke({ connection, signal }) {
-    const token = connection.refreshToken ?? connection.accessToken
-    if (typeof token !== 'string' || token === '') return 'unconfirmed'
+    const token = connection.pendingRefresh?.refreshToken ?? connection.refreshToken
+    if (typeof token !== 'string' || token === '') return connection.accessToken ? 'unconfirmed' : 'no-session'
     let provider
     try {
       provider = await this.discovery(signal)

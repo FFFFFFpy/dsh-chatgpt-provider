@@ -9,7 +9,9 @@
  * `top_p`, `max_output_tokens`, `metadata`, `truncation`, `user`, and
  * `previous_response_id`.
  */
-import { ChatGptError, CODES, errorShape, toLlmError } from './errors.js'
+import { ChatGptError, CODES, apiError, toLlmError } from './errors.js'
+
+const TOOL_NAMESPACE = 'dsh'
 
 /** Block types this adapter emits, in the order their block-start opened. */
 const BLOCK = { text: 'text', reasoning: 'reasoning', toolCall: 'tool-call' }
@@ -84,11 +86,16 @@ export async function toInput(messages, projectors) {
       continue
     }
     if (message.role === 'tool') {
-      const text = joinText(message.content)
+      let output = await userContent(message.content, projectors.imagePart, projectors.fileText)
+      if (message.isError === true) {
+        if (Array.isArray(output)) output.unshift({ type: 'input_text', text: '[error]' })
+        else output = '[error] ' + output
+      }
       items.push({
         type: 'function_call_output',
         call_id: String(message.toolCallId ?? message.source?.callId ?? ''),
-        output: message.isError === true ? `[error] ${text}` : text,
+        namespace: TOOL_NAMESPACE,
+        output,
       })
       continue
     }
@@ -99,6 +106,7 @@ export async function toInput(messages, projectors) {
         if (block?.type === 'tool-call') {
           items.push({
             type: 'function_call',
+            namespace: TOOL_NAMESPACE,
             call_id: String(block.id),
             name: block.name,
             arguments: typeof block.arguments === 'string' ? block.arguments : '{}',
@@ -131,13 +139,16 @@ export async function buildBody({ model, messages, system, tools, reasoningEffor
   }
   if (typeof system === 'string' && system !== '') body.instructions = system
   if (Array.isArray(tools) && tools.length > 0) {
-    body.tools = tools.map(tool => ({
-      type: 'function',
-      name: tool.name,
-      description: typeof tool.description === 'string' ? tool.description : '',
-      parameters: tool.parameters !== null && typeof tool.parameters === 'object' ? tool.parameters : { type: 'object', properties: {} },
-      strict: false,
-    }))
+    body.tools = [{
+      type: 'namespace', name: TOOL_NAMESPACE, description: 'DeepSeek Harness tools.',
+      tools: tools.map(tool => ({
+        type: 'function',
+        name: tool.name,
+        description: typeof tool.description === 'string' ? tool.description : '',
+        parameters: tool.parameters ?? { type: 'object', properties: {} },
+        strict: false,
+      })),
+    }]
     body.tool_choice = 'auto'
   }
   const effort = typeof reasoningEffort === 'string' ? reasoningEffort : ''
@@ -154,36 +165,29 @@ async function* events(response) {
   if (response.body === null) {
     throw new ChatGptError(CODES.invalid_stream, 'ChatGPT did not return the expected response stream.', { retryable: true, status: response.status })
   }
-  const decoder = new TextDecoder()
   let buffer = ''
-  for await (const chunk of response.body) {
-    buffer += decoder.decode(chunk, { stream: true })
-    for (;;) {
-      const boundary = buffer.indexOf('\n\n')
-      if (boundary < 0) break
-      const raw = buffer.slice(0, boundary)
+  let endedWithCR = false
+  for await (let chunk of response.body.pipeThrough(new TextDecoderStream())) {
+    if (!chunk) continue
+    if (endedWithCR && chunk.startsWith('\n')) chunk = chunk.slice(1)
+    endedWithCR = chunk.endsWith('\r')
+    buffer += chunk.replace(/\r\n?/g, '\n')
+    let boundary
+    while ((boundary = buffer.indexOf('\n\n')) >= 0) {
+      const frame = buffer.slice(0, boundary)
       buffer = buffer.slice(boundary + 2)
-      const data = raw.split('\n')
+      const data = frame.split('\n')
         .filter(line => line.startsWith('data:'))
-        .map(line => line.slice(5).trim())
+        .map(line => line.slice(5).replace(/^ /, ''))
         .join('\n')
-      if (data === '' || data === '[DONE]') continue
+      if (!data || data === '[DONE]') continue
+      let event
       try {
-        const event = JSON.parse(data)
-        if (event !== null && typeof event === 'object') yield event
+        event = JSON.parse(data)
       } catch {
-        // A keepalive or comment line is not an event.
+        throw new ChatGptError(CODES.invalid_stream, 'ChatGPT sent an invalid streaming event.', { retryable: true })
       }
-    }
-  }
-  buffer += decoder.decode()
-  const tail = buffer.trim()
-  if (tail.startsWith('data:')) {
-    try {
-      const event = JSON.parse(tail.slice(5).trim())
-      if (event !== null && typeof event === 'object') yield event
-    } catch {
-      /* ignore */
+      if (event && typeof event === 'object') yield event
     }
   }
 }
@@ -210,11 +214,7 @@ export async function* translate(response, { onEvent, signal } = {}) {
     } catch {
       parsed = body.slice(0, 400)
     }
-    throw toLlmError(new ChatGptError(
-      errorShape(parsed).code ?? `http_${response.status}`,
-      `${errorShape(parsed).message} (HTTP ${response.status})`,
-      { status: response.status, retryable: response.status >= 500 || response.status === 429 },
-    ))
+    throw toLlmError(apiError(parsed, response.status, response.headers.get('x-request-id')))
   }
 
   /** @type {Map<string, { index: number, kind: string, text: string, name?: string, callId?: string }>} */
@@ -375,11 +375,7 @@ export async function* translate(response, { onEvent, signal } = {}) {
     }
     if (type === 'response.failed' || type === 'error') {
       const detail = type === 'response.failed' ? event.response?.error ?? event.response : event.error ?? event
-      const shape = errorShape(detail !== null && typeof detail === 'object' && 'error' in detail ? detail : { error: detail })
-      throw toLlmError(new ChatGptError(shape.code ?? `http_${response.status}`, `${shape.message} (HTTP ${response.status})`, {
-        status: response.status,
-        retryable: response.status >= 500 || response.status === 429,
-      }))
+      throw toLlmError(apiError({ error: detail }, response.status, response.headers.get('x-request-id')))
     }
   }
 

@@ -47,6 +47,7 @@ function fail(error) {
       message: failure.message,
       retryable: failure.retryable === true,
       ...failure.status === undefined ? {} : { status: failure.status },
+      ...(failure.requestId ? { requestId: failure.requestId } : {}),
     },
   })
 }
@@ -64,6 +65,19 @@ async function settle(run) {
   }
 }
 
+/** Read the settings action's optional JSON object, including an empty POST. */
+async function actionOptions(request) {
+  const body = await request.text()
+  if (!body) return {}
+  try {
+    const options = JSON.parse(body)
+    if (options && typeof options === 'object' && !Array.isArray(options)) return options
+  } catch {
+    // Both malformed JSON and the wrong shape are invalid actions.
+  }
+  throw new ChatGptError('invalid_request', 'Expected a JSON object for this ChatGPT action.')
+}
+
 /**
  * Build every route the settings page calls.
  * @param {object} options - route options.
@@ -75,20 +89,33 @@ export function createRoutes({ session }) {
     {
       path: `${API_PREFIX}/state`,
       methods: ['GET'],
-      fetch: async () => {
-        try {
-          return ok(await session.state())
-        } catch (error) {
-          return fail(error)
-        }
-      },
+      fetch: request => settle(() => session.state({ models: new URL(request.url).searchParams.get('models') !== '0' })),
     },
     {
       path: `${API_PREFIX}/signin`,
       methods: ['POST'],
-      fetch: async () => settle(async () => {
-        const started = await session.beginSignIn()
+      fetch: request => settle(async () => {
+        const { clientId, newProfile, reconsent } = await actionOptions(request)
+        const started = await session.beginSignIn({ clientId, newProfile: newProfile === true, reconsent: reconsent === true })
         return { url: started.url, browserOpened: started.browserOpened }
+      }),
+    },
+    {
+      path: `${API_PREFIX}/profiles/select`,
+      methods: ['POST'],
+      fetch: request => settle(async () => {
+        const { clientId } = await actionOptions(request)
+        await session.selectProfile(clientId)
+        return { activeId: clientId }
+      }),
+    },
+    {
+      path: `${API_PREFIX}/welcome`,
+      methods: ['POST'],
+      fetch: request => settle(async () => {
+        const { clientId } = await actionOptions(request)
+        await session.acknowledgePlan(clientId)
+        return session.state({ models: false })
       }),
     },
     {

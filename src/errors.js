@@ -45,6 +45,7 @@ export class ChatGptError extends Error {
    * @param {boolean} [options.retryable] - whether a bounded retry may succeed.
    * @param {number} [options.status] - HTTP status when one was received.
    * @param {string} [options.requestId] - provider request id when present.
+   * @param {string} [options.param] - provider field that failed validation.
    * @param {unknown} [options.cause] - underlying error.
    */
   constructor(code, message, options = {}) {
@@ -54,6 +55,7 @@ export class ChatGptError extends Error {
     this.retryable = options.retryable === true
     if (options.status !== undefined) this.status = options.status
     if (options.requestId !== undefined) this.requestId = options.requestId
+    if (options.param !== undefined) this.param = options.param
   }
 }
 
@@ -116,11 +118,12 @@ export function errorShape(body) {
  */
 export function apiError(body, status, requestId) {
   const shape = errorShape(body)
-  const retryable = status === 429 || status >= 500
-  const suffix = shape.code === undefined ? '' : ` (${shape.code})`
-  return new ChatGptError(shape.code ?? `http_${status}`, `${shape.message}${suffix}`, {
+  const unavailable = shape.code === 'subscription_sharing_usage_unavailable' || shape.code === 'subscription_sharing_user_unavailable'
+  const retryable = shape.code !== 'subscription_sharing_usage_limit_exceeded' && (unavailable || status === 429 || status >= 500)
+  return new ChatGptError(shape.code ?? `http_${status}`, shape.message, {
     retryable,
     status,
+    param: shape.param,
     ...requestId === null || requestId === undefined ? {} : { requestId },
   })
 }
@@ -133,7 +136,6 @@ const SIGN_IN_CODES = new Set([
   'refresh_token_expired',
   'refresh_token_invalidated',
   'refresh_token_reused',
-  'subscription_sharing_invalid_user',
 ])
 
 /**
@@ -143,9 +145,7 @@ const SIGN_IN_CODES = new Set([
  * @returns {boolean} true when only a fresh sign-in can recover.
  */
 export function requiresSignIn(error) {
-  if (!(error instanceof ChatGptError)) return false
-  if (error.status === 401) return true
-  return typeof error.code === 'string' && SIGN_IN_CODES.has(error.code)
+  return error instanceof ChatGptError && SIGN_IN_CODES.has(error.code)
 }
 
 /**
@@ -167,25 +167,32 @@ export function toLlmError(error) {
   const status = failure.status
   const code = failure.code
   const providerCode = code === `http_${status}` ? undefined : code
-  const detail = providerCode === undefined ? failure.message : `${failure.message} [${providerCode}]`
+  const detail = providerCode === undefined || failure.message === providerCode ? failure.message : `${failure.message} [${providerCode}]`
   const requestId = typeof failure.requestId === 'string' ? failure.requestId : undefined
 
-  if (code === CODES.not_signed_in || requiresSignIn(failure)) {
-    return new LlmRequestError('ChatGPT is not signed in. Open Settings > ChatGPT and sign in to continue.', 'ACCOUNT_SIGN_IN_REQUIRED', { cause: failure, requestId })
+  if (code === CODES.not_signed_in) {
+    return new LlmRequestError(failure.message, 'ACCOUNT_SIGN_IN_REQUIRED', { cause: failure, status, requestId })
   }
-  if (code === 'subscription_sharing_usage_limit_exceeded' || status === 429) {
-    return new LlmRequestError(`${detail} ChatGPT plan usage is paused; see ChatGPT Settings > Usage.`, 'QUOTA', { cause: failure, status, requestId })
+  if (code === 'subscription_sharing_usage_limit_exceeded') {
+    return new LlmRequestError(`${detail} Manage ChatGPT usage at https://chatgpt.com/settings/usage`, 'QUOTA', { cause: failure, status, requestId })
   }
   if (code === 'subscription_sharing_user_not_eligible' || code === 'subscription_sharing_route_not_supported' || code === 'chatpass_v2_scope_not_authorized' || code === 'chatpass_v2_invalid_authorization_context') {
     return new LlmRequestError(`${detail} The signed-in account cannot use ChatGPT plan usage for this request.`, 'AUTH', { cause: failure, status, requestId })
   }
+  if (code === 'sharing_not_enabled') return new LlmRequestError(detail, 'AUTH', { cause: failure, status, requestId })
+  if (code === 'subscription_sharing_usage_unavailable' || code === 'subscription_sharing_user_unavailable' || code === CODES.identity_verification_unavailable || code === 'refresh_not_ready') {
+    return new LlmRequestError(detail, 'SERVER', { cause: failure, status, requestId })
+  }
   if (code === 'subscription_sharing_unsupported_capability') {
-    return new LlmRequestError(detail, 'UNSUPPORTED_OPTION', { cause: failure, status, requestId })
+    return new LlmRequestError(failure.param ? detail + ' (' + failure.param + ')' : detail, 'UNSUPPORTED_OPTION', { cause: failure, status, requestId })
   }
   if (code === 'context_length_exceeded' || code === 'string_above_max_length' || /context (window|length)/i.test(failure.message)) {
     return new LlmRequestError(detail, 'CONTEXT_WINDOW_EXCEEDED', { cause: failure, status, requestId })
   }
-  if (status === 401 || status === 403) {
+  if (code === 'subscription_sharing_invalid_user' || status === 401) {
+    return new LlmRequestError(`${detail} Check the selected ChatGPT account, workspace and granted permissions.`, 'AUTH', { cause: failure, status, requestId })
+  }
+  if (status === 403) {
     return new LlmRequestError(detail, 'AUTH', { cause: failure, status, requestId })
   }
   if (status === 429) {

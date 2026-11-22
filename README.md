@@ -16,14 +16,14 @@ The bundle registers one provider route, `chatgpt`, that speaks the [Sign in wit
 ## Use it
 
 1. Open **Settings → ChatGPT**.
-2. Choose **Sign in with ChatGPT**; the system browser opens the ChatGPT sign-in page.
-3. Finish there, then return to the harness. The page updates itself.
+2. Choose **Continue with ChatGPT**. In the browser, select the account and workspace and grant plan usage to use models.
+3. Return to the harness. If you granted identity access only, choose **Enable ChatGPT plan usage** when you want to use models.
 4. Open the composer's model menu and pick a ChatGPT model.
 5. Send a message.
 
 ## What is stored, and where
 
-- The OAuth grant (access token, rotating refresh token, retained ID token, issued `client_id`, verified subject and email) lives in the harness credential store under the record key `chatgpt-provider/default`, never in configuration and never in browser storage.
+- The harness credential store keeps the official registrations in `chatgpt-provider/default`, keyed by the issued client ID for each account and workspace. A loopback deployment uses its own credential record. Older grants lack a recorded issuer and resource. The upgrade retains their registration and prompts for sign-in once.
 - The host identifier (`urn:uuid:…`) lives beside it under `chatgpt-provider/host` and is reused across sign-ins.
 - The settings page never receives a token; the JSON API sends only account, plan, and model metadata.
 
@@ -37,7 +37,7 @@ Every field is optional. The row is `chatgpt-provider` in the profile's `cordis.
 | `redirectPort` | `1455` | Loopback callback port; `0` lets the OS choose |
 | `authBaseURL` | `https://auth.openai.com` | Authorization server; change only for a local stand-in |
 | `apiBaseURL` | `https://api.openai.com/v1` | API root and OAuth resource audience |
-| `sendHostId` | `true` | Send `ext_agent_host_id` on authorization requests |
+| `sendHostId` | `true` | The official issuer always receives the host ID. A loopback stand-in can disable it. |
 | `browserCommand` | empty | Launcher command instead of the platform default |
 | `defaultInput` | `[text, image]` | Modalities claimed for a model that declares none |
 | `defaultContextWindow` | `128000` | Context window assumed when the catalog does not size a model |
@@ -64,16 +64,16 @@ Every field is optional. The row is `chatgpt-provider` in the profile's `cordis.
 
 ## Limits
 
-- **One account per harness profile.** This version stores a single ChatGPT registration; a second account replaces it.
+- **Account selection.** Use **Add account or workspace** for a separate registration. Select a saved connection to use its models. Signing out clears its tokens and retains its client ID for the next sign-in.
 - **The ChatGPT plan route rejects fields an ordinary API accepts.** `temperature`, `max_output_tokens`, `top_p`, `metadata`, and `previous_response_id` are never sent, and `stop` sequences fail with `UNSUPPORTED_OPTION`.
 - **Reasoning is not replayed.** With `store: false`, earlier reasoning blocks are omitted from later requests; text and tool calls are preserved.
-- **Eligibility is OpenAI's.** An account, workspace, or policy without ChatGPT plan usage fails with `ACCOUNT_SIGN_IN_REQUIRED` or `AUTH`, and the error names the provider code.
-- **Usage is shared.** The ChatGPT five-hour limit is shared across every app using the plan, and limits are managed in ChatGPT Settings → Usage.
+- **Eligibility.** Missing plan permission or denied API admission produces `AUTH`. An expired or revoked renewable session requires sign-in. The settings page can request plan permission for an existing registration.
+- **Usage depends on the plan.** Plus shares a five-hour limit across connected apps. This particular limit does not apply to Pro. Manage app usage in ChatGPT Settings → Usage. [Tracking usage](https://developers.openai.com/siwc/token-sharing-open-source/profiles-and-sessions#tracking-usage)
 - **Sign-out revokes best effort.** If the revocation endpoint cannot be reached, credentials are cleared locally and the page says remote revocation was not confirmed.
 
 ## Tests
 
-Both suites run under plain Node with no harness installation and no network: they start a local stand-in for the authorization server and the Responses API.
+After `npm ci`, run the existing suites with Node. The integration suite uses a local stand-in for OAuth and the Responses API.
 
 ```sh
 node test/run.mjs           # OAuth, token store/refresh, stream translation, error mapping
@@ -84,5 +84,7 @@ node test/routes.test.mjs   # the settings API envelope and configuration normal
 
 - System guidance travels in `instructions`.
 - History `system`/`developer` messages become `developer` items.
-- Assistant tool calls become `function_call` items and tool results become `function_call_output` items, so tool rounds replay correctly.
+- Tools are declared in the `dsh` namespace. Assistant calls and tool results replay with that namespace and their original call IDs. Tool results can contain both text and images.
 - Images are projected through the attachment service into `input_image` data URLs; files contribute the harness's deterministic file handle text.
+
+The sign-in button uses the [official DevKit mark](https://github.com/openai/sign-in-with-chatgpt-devkit/blob/0a36fefeb913055c8c7a1a29b63d82b96b2e841a/assets/brand/chatgpt-button-white-21.svg).

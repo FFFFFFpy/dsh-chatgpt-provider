@@ -6,13 +6,13 @@
  * the Sign in with ChatGPT OAuth flow, and the small JSON API the settings page
  * uses to sign in, refresh, and sign out.
  *
- * The bundle resolves only its own modules, so configuration is normalized
- * here instead of through a schema package the profile does not resolve.
+ * The host projects the model catalog schema into its Models settings editor.
  */
-import { API_PREFIX, PROVIDER, RECORD_KEY, SETTINGS_NS } from './src/constants.js'
+import Schema from '@deepseek-ai/schemastery'
+import { API_PREFIX, ISSUER, PROVIDER, RESOURCE } from './src/constants.js'
 import { ChatGptAdapter } from './src/adapter.js'
-import { ChatGptError, CODES } from './src/errors.js'
-import { ChatGPTAuth } from './src/oauth.js'
+import { ChatGptError } from './src/errors.js'
+import { ChatGPTAuth, resolveEndpoints } from './src/oauth.js'
 import { createRoutes } from './src/routes.js'
 import { ChatGptSession } from './src/session.js'
 
@@ -22,18 +22,20 @@ export const name = 'chatgpt-provider'
 /** Services the provider needs; `authorization` is optional and joined below. */
 export const inject = ['llm', 'connection', 'credentials']
 
+/** The Models editor projects volatile fields under the loader entry's settings namespace. */
+export const Config = Schema.object({
+  // modelCatalog normalizes each row, including catalogs from older profiles.
+  models: Schema.array(Schema.any()).default([]).loose().volatile(),
+})
+
 /** Every field's default: a bare row works. */
 const DEFAULTS = Object.freeze({
   appName: 'DeepSeek Harness',
   redirectPort: 1455,
-  authBaseURL: 'https://auth.openai.com',
-  apiBaseURL: 'https://api.openai.com/v1',
-  sendHostId: true,
   browserCommand: '',
   defaultInput: ['text', 'image'],
   defaultContextWindow: 128000,
   reasoningEfforts: ['low', 'medium', 'high'],
-  models: [],
   modelCacheSeconds: 600,
   requestTimeoutMs: 180000,
   signInTimeoutMs: 300000,
@@ -58,27 +60,6 @@ function text(value, fallback) {
  */
 function count(value, fallback) {
   return Number.isFinite(value) && Number(value) >= 0 ? Number(value) : fallback
-}
-
-/**
- * Accept an http(s) origin or URL.
- * @param {unknown} value - candidate.
- * @param {string} fallback - default.
- * @param {string} label - configuration field name.
- * @returns {string} the normalized URL.
- */
-function url(value, fallback, label) {
-  const candidate = typeof value === 'string' && value.trim() !== '' ? value.trim() : fallback
-  let parsed
-  try {
-    parsed = new URL(candidate)
-  } catch {
-    throw new ChatGptError(CODES.configuration, `${label} must be an absolute http(s) URL; got "${candidate}".`)
-  }
-  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-    throw new ChatGptError(CODES.configuration, `${label} must be an http(s) URL; got "${candidate}".`)
-  }
-  return candidate.replace(/\/+$/, '')
 }
 
 /**
@@ -136,17 +117,19 @@ function modelCatalog(value) {
  */
 export function resolveConfig(raw) {
   const input = raw !== null && typeof raw === 'object' ? raw : {}
+  const endpoints = resolveEndpoints(text(input.authBaseURL, ISSUER), text(input.apiBaseURL, RESOURCE))
   return {
     appName: text(input.appName, DEFAULTS.appName),
     redirectPort: count(input.redirectPort, DEFAULTS.redirectPort),
-    authBaseURL: url(input.authBaseURL, DEFAULTS.authBaseURL, 'authBaseURL'),
-    apiBaseURL: url(input.apiBaseURL, DEFAULTS.apiBaseURL, 'apiBaseURL'),
-    sendHostId: input.sendHostId === undefined ? DEFAULTS.sendHostId : input.sendHostId !== false,
+    ...endpoints,
+    sendHostId: endpoints.authBaseURL === ISSUER || input.sendHostId !== false,
     browserCommand: text(input.browserCommand, DEFAULTS.browserCommand),
     defaultInput: modalities(input.defaultInput, DEFAULTS.defaultInput),
     defaultContextWindow: count(input.defaultContextWindow, DEFAULTS.defaultContextWindow),
     reasoningEfforts: efforts(input.reasoningEfforts, DEFAULTS.reasoningEfforts),
-    models: modelCatalog(input.models),
+    get models() {
+      return modelCatalog(typeof input.models?.get === 'function' ? input.models.get() : input.models)
+    },
     modelCacheSeconds: count(input.modelCacheSeconds, DEFAULTS.modelCacheSeconds),
     requestTimeoutMs: count(input.requestTimeoutMs, DEFAULTS.requestTimeoutMs),
     signInTimeoutMs: count(input.signInTimeoutMs, DEFAULTS.signInTimeoutMs),
@@ -175,14 +158,18 @@ export function apply(ctx, rawConfig) {
   const session = new ChatGptSession({ ctx, config, auth, logger })
   ctx.effect(() => () => session.dispose(), 'chatgpt-provider: session')
 
+  ctx.inject(['settings'], scope => {
+    scope.effect(() => scope.settings.configure({ auto: false }, ctx.fiber))
+  })
+
   // One directory entry: configuration surfaces can show the provider before
   // it has any route of its own, and `nativeAuth.oauth` tells them the
   // credential comes from a sign-in rather than a key field.
   ctx.effect(() => ctx.llm.registerConfigurableProviders([{
     provider: PROVIDER,
     displayName: 'ChatGPT',
-    settingsNs: SETTINGS_NS,
-    settingsPath: ['providers', PROVIDER],
+    settingsNs: ctx.fiber.entry?.options.id ?? name,
+    settingsPath: [],
     nativeAuth: { env: [], oauth: true },
     defaultBaseURL: config.apiBaseURL,
   }]), 'chatgpt-provider: configurable provider')
@@ -204,18 +191,18 @@ export function apply(ctx, rawConfig) {
 
   // The seam is optional: a headless composition simply has no surface to run
   // a flow from, while the provider itself still works from the settings API.
-  ctx.inject(['authorization'], authorization => {
-    ctx.effect(() => authorization.registerFlow({
-      key: RECORD_KEY,
+  ctx.inject(['authorization'], scope => {
+    scope.authorization.registerFlow({
+      key: session.key,
       label: 'ChatGPT',
-      methods: [{ id: 'oauth', label: 'Sign in with ChatGPT' }],
+      methods: [{ id: 'oauth', label: 'Continue with ChatGPT' }],
       async run(flow) {
-        const started = await session.beginSignIn()
+        const started = await session.beginSignIn({ signal: flow.signal })
         flow.notify({ message: 'Continue in your browser to authorize ChatGPT, then return here.', url: started.url })
-        const outcome = await session.waitForSignIn(flow.signal)
+        const outcome = await started.done
         if (!outcome.ok) throw new ChatGptError(outcome.error.code, outcome.error.message)
       },
-    }), 'chatgpt-provider: authorization flow')
+    })
   })
 
   logger?.info?.(`chatgpt-provider: ready (provider "${PROVIDER}", settings ${API_PREFIX})`)

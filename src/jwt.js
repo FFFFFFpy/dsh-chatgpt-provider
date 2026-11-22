@@ -42,15 +42,16 @@ function parse(token) {
 /**
  * Fetch and cache one issuer's key set.
  * @param {string} uri - JWKS location.
+ * @param {string | undefined} kid - signing key named by the provider.
  * @param {AbortSignal} [signal] - caller cancellation.
  * @returns {Promise<{ keys: Array<Record<string, unknown>> }>} the key set.
  */
-async function keySet(uri, signal) {
+async function keySet(uri, kid, signal) {
   const cached = keyCache.get(uri)
-  if (cached !== undefined && cached.expiresAt > Date.now()) return cached.value
+  if (cached && cached.expiresAt > Date.now() && (!kid || cached.value.keys.some(key => key?.kid === kid))) return cached.value
   let response
   try {
-    response = await fetch(uri, { headers: { accept: 'application/json' }, ...signal === undefined ? {} : { signal } })
+    response = await fetch(uri, { headers: { accept: 'application/json' }, redirect: 'error', signal })
   } catch (error) {
     throw new ChatGptError(CODES.identity_verification_unavailable, 'ChatGPT identity verification is temporarily unavailable. Try again shortly.', { retryable: true, cause: error })
   }
@@ -91,8 +92,8 @@ export async function verifyIdToken({ idToken, issuer, clientId, nonce, jwksUri,
   if (token.header.alg !== 'RS256') {
     throw new ChatGptError(CODES.invalid_id_token, 'The ChatGPT identity could not be verified. Please sign in again.')
   }
-  const keys = await keySet(jwksUri, signal)
   const kid = typeof token.header.kid === 'string' ? token.header.kid : undefined
+  const keys = await keySet(jwksUri, kid, signal)
   const candidates = keys.keys.filter(key => key !== null && typeof key === 'object'
     && (kid === undefined || key.kid === kid)
     && (key.kty === 'RSA'))

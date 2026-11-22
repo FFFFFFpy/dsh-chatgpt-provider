@@ -275,10 +275,14 @@ export class ChatGptAdapter {
       }
       throw toLlmError(apiError(parsed, response.status, response.headers.get('x-request-id')))
     }
-    yield* translate(response, {
-      signal,
-      ...this.config.trace === true ? { onEvent: event => this.logger?.debug?.('chatgpt: event %s', event.type) } : {},
-    })
+    try {
+      yield* translate(response, {
+        signal,
+        ...this.config.trace === true ? { onEvent: event => this.logger?.debug?.('chatgpt: event %s', event.type) } : {},
+      })
+    } catch (error) {
+      throw toLlmError(signal.aborted ? signal.reason : error)
+    }
   }
 }
 

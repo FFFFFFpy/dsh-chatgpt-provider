@@ -8,6 +8,7 @@
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
+    "./assets/*": "./lib/assets/*",
     "./locale/*.json": "./locale/*.json",
     "./icon": "./icon.svg",
     "./cordis.patch.yml": "./cordis.patch.yml",
@@ -16,6 +17,7 @@
   "files": [
     "index.js",
     "client.js",
+    "lib/assets",
     "src",
     "locale/*.json",
     "docs",
@@ -45,5 +47,8 @@
     "openai",
     "provider"
   ],
-  "license": "MIT"
+  "license": "MIT",
+  "dependencies": {
+    "@deepseek-ai/schemastery": "3.19.0"
+  }
 }
