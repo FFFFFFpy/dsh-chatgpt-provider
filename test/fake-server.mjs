@@ -192,7 +192,31 @@ export async function startFakeOpenAI() {
       }
       json({
         models: [
-          { slug: 'gpt-test', display_name: 'GPT Test', visibility: 'list', context_window: 272000, reasoning_efforts: ['low', 'high'] },
+          {
+            slug: 'gpt-test',
+            display_name: 'GPT Test',
+            visibility: 'list',
+            context_window: 272000,
+            // The plan route publishes levels as objects, not bare strings.
+            supported_reasoning_levels: [
+              { effort: 'low', description: 'Fast responses with lighter reasoning' },
+              { effort: 'medium', description: 'Balances speed and reasoning depth for everyday tasks' },
+              { effort: 'high', description: 'Greater reasoning depth for complex problems' },
+              { effort: 'xhigh', description: 'Extra high reasoning depth for complex problems' },
+              { effort: 'max', description: 'Maximum reasoning depth for the hardest problems' },
+              { effort: 'ultra', description: 'Maximum reasoning with automatic task delegation' },
+            ],
+            default_reasoning_level: 'low',
+          },
+          // Advertises no levels at all: the configured fallback applies.
+          { slug: 'gpt-plain', display_name: 'GPT Plain', visibility: 'list', context_window: 128000 },
+          // A gateway that still publishes the older string list.
+          {
+            slug: 'gpt-legacy-levels',
+            display_name: 'GPT Legacy Levels',
+            visibility: 'list',
+            reasoning_efforts: ['low', 'high'],
+          },
           { slug: 'hidden-model', display_name: 'Hidden', visibility: 'hidden' },
         ],
       })

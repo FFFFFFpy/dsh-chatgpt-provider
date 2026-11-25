@@ -191,7 +191,7 @@ await test('the settings state omits every token and lists the account models', 
   assert.equal(state.plan.sharing, true)
   assert.equal(state.account.email, 'user@example.com')
   assert.equal(state.renewable, true)
-  assert.deepEqual(state.models.map(model => model.id), ['gpt-test'])
+  assert.deepEqual(state.models.map(model => model.id), ['gpt-test', 'gpt-plain', 'gpt-legacy-levels'])
   assert.deepEqual(state.profiles.map(profile => profile.clientId), ['oaiapp_test'])
   const serialized = JSON.stringify(state)
   for (const secret of ['at-code', 'rt-code', 'id_token', 'refreshToken', 'accessToken']) {
@@ -305,6 +305,28 @@ await test('the route declares in-history system prompt updates so the prefix su
   const resolved = await adapter.resolveModel('chatgpt', 'gpt-test')
   assert.equal(resolved.systemPromptUpdate, 'in-history')
   assert.equal(resolved.toolUpdate, undefined)
+})
+
+await test('every reasoning level the catalog advertises becomes a pickable effort', async () => {
+  const resolved = await adapter.resolveModel('chatgpt', 'gpt-test')
+  assert.deepEqual(resolved.reasoning.efforts, [
+    { id: 'low', name: 'Low' },
+    { id: 'medium', name: 'Medium' },
+    { id: 'high', name: 'High' },
+    { id: 'xhigh', name: 'Extra high' },
+    { id: 'max', name: 'Max' },
+    { id: 'ultra', name: 'Ultra' },
+  ])
+})
+
+await test('a model that advertises no levels keeps the configured fallback', async () => {
+  const resolved = await adapter.resolveModel('chatgpt', 'gpt-plain')
+  assert.deepEqual(resolved.reasoning.efforts.map(effort => effort.id), ['low', 'medium', 'high'])
+})
+
+await test('a gateway that publishes a plain string list is still understood', async () => {
+  const resolved = await adapter.resolveModel('chatgpt', 'gpt-legacy-levels')
+  assert.deepEqual(resolved.reasoning.efforts.map(effort => effort.id), ['low', 'high'])
 })
 
 await test('a second round repeats the first request prefix byte for byte', async () => {

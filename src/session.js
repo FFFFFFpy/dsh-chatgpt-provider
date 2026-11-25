@@ -34,6 +34,24 @@ async function jsonBody(response) {
 }
 
 /**
+ * Read one advertised reasoning level as its effort id.
+ *
+ * The plan catalog publishes `supported_reasoning_levels` as objects
+ * (`{ effort, description }`), while gateways and older payloads may publish a
+ * plain string list under a different key.
+ *
+ * @param {unknown} level - one advertised level.
+ * @returns {string | undefined} the effort id, or undefined when unusable.
+ */
+function levelEffort(level) {
+  if (typeof level === 'string') return level.trim() === '' ? undefined : level.trim()
+  if (level !== null && typeof level === 'object' && typeof level.effort === 'string') {
+    return level.effort.trim() === '' ? undefined : level.effort.trim()
+  }
+  return undefined
+}
+
+/**
  * Normalize one models-listing entry.
  * @param {unknown} entry - provider entry.
  * @returns {{ id: string, name: string, contextWindow?: number, maxTokens?: number, reasoningEfforts?: string[] } | undefined} normalized model, or undefined when unusable.
@@ -47,8 +65,14 @@ function normalizeModel(entry) {
   const name = typeof display === 'string' && display.trim() !== '' ? display.slice(0, 200) : slug
   const contextWindow = Number(entry.context_window ?? entry.contextWindow)
   const maxTokens = Number(entry.max_output_tokens ?? entry.maxTokens)
-  const efforts = Array.isArray(entry.reasoning_efforts ?? entry.reasoningEfforts)
-    ? (entry.reasoning_efforts ?? entry.reasoningEfforts).filter(value => typeof value === 'string' && value !== '')
+  // The plan route advertises every selectable level per model, including
+  // `xhigh`, `max`, and `ultra`, so the picker must follow the catalog rather
+  // than a fixed set. A model that advertises nothing keeps the configured
+  // fallback.
+  const advertised = entry.supported_reasoning_levels ?? entry.supportedReasoningLevels
+  const listed = advertised !== undefined ? advertised : entry.reasoning_efforts ?? entry.reasoningEfforts
+  const efforts = Array.isArray(listed)
+    ? [...new Set(listed.map(levelEffort).filter(value => value !== undefined))]
     : undefined
   return {
     id: slug,

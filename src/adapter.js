@@ -27,6 +27,7 @@ const EFFORT_LABELS = {
   high: 'High',
   xhigh: 'Extra high',
   max: 'Max',
+  ultra: 'Ultra',
 }
 
 /**
