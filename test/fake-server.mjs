@@ -1,13 +1,19 @@
 /**
  * A local stand-in for the Sign in with ChatGPT authorization server and the
- * Responses API, so the OAuth flow, the token store, the model catalog, and the
- * adapter's stream translation can be exercised without real credentials.
+ * Responses API, so the OAuth flow, the profile store, refresh rotation, the
+ * model catalog, and the adapter's stream translation run without real
+ * credentials.
+ *
+ * The endpoints are loopback-only, which is exactly what the bundle's
+ * `resolveEndpoints` accepts for a non-official deployment.
  */
 import { createServer } from 'node:http'
 import { createSign, generateKeyPairSync } from 'node:crypto'
 
 const { privateKey, publicKey } = generateKeyPairSync('rsa', { modulusLength: 2048 })
 const publicJwk = publicKey.export({ format: 'jwk' })
+
+const PLAN_SCOPES = 'chatgpt.tokens.use.direct email offline_access openid profile resource.invoke'
 
 /**
  * Base64url encode a buffer.
@@ -50,7 +56,12 @@ export async function startFakeOpenAI() {
     clientId: 'oaiapp_test',
     subject: 'user-1',
     email: 'user@example.com',
+    name: 'Test User',
+    scopes: PLAN_SCOPES,
+    /** Epoch seconds; defaults to just before now so a refresh window is open. */
+    earliestRefreshAt: undefined,
     refreshFails: false,
+    refreshIdToken: true,
   }
   const recordings = { tokenRequests: [], responses: [], revocations: [], models: 0 }
 
@@ -97,7 +108,7 @@ export async function startFakeOpenAI() {
         aud: state.clientId,
         sub: state.subject,
         email: state.email,
-        name: 'Test User',
+        name: state.name,
         nonce: state.nonce,
         iat: now,
         exp: now + 3600,
@@ -109,8 +120,8 @@ export async function startFakeOpenAI() {
           id_token: signIdToken(claims),
           token_type: 'Bearer',
           expires_in: 3600,
-          scope: 'chatgpt.tokens.use.direct email offline_access openid profile resource.invoke',
-          earliest_refresh_at: now + 60,
+          scope: state.scopes,
+          earliest_refresh_at: state.earliestRefreshAt ?? now - 1,
         })
         return
       }
@@ -123,10 +134,10 @@ export async function startFakeOpenAI() {
         json({
           access_token: 'at-refreshed',
           refresh_token: 'rt-refreshed',
-          id_token: signIdToken({ ...claims, exp: now + 3600 }),
+          ...state.refreshIdToken ? { id_token: signIdToken({ ...claims, exp: now + 3600 }) } : {},
           token_type: 'Bearer',
           expires_in: 3600,
-          scope: 'chatgpt.tokens.use.direct email offline_access openid profile resource.invoke',
+          scope: state.scopes,
         })
         return
       }
@@ -136,7 +147,8 @@ export async function startFakeOpenAI() {
     }
     if (url.pathname === '/v1/models') {
       recordings.models += 1
-      if (request.headers.authorization !== 'Bearer at-code' && request.headers.authorization !== 'Bearer at-refreshed') {
+      const token = request.headers.authorization
+      if (token !== 'Bearer at-code' && token !== 'Bearer at-refreshed') {
         response.writeHead(401, { 'content-type': 'application/json' })
         response.end(JSON.stringify({ error: { code: 'invalid_api_key', message: 'bad token' } }))
         return
@@ -157,7 +169,7 @@ export async function startFakeOpenAI() {
         response.end(JSON.stringify({ error: { code: 'subscription_sharing_usage_limit_exceeded', message: 'Usage limit reached.', type: 'invalid_request_error' } }))
         return
       }
-      if (state.mode === 'unsupported-purpose') {
+      if (state.mode === 'ineligible') {
         response.writeHead(403, { 'content-type': 'application/json' })
         response.end(JSON.stringify({ error: { code: 'subscription_sharing_user_not_eligible', message: 'Not eligible.' } }))
         return
@@ -173,7 +185,6 @@ export async function startFakeOpenAI() {
       send(response, { type: 'response.output_text.delta', item_id: 'msg-1', delta: 'Hello' })
       send(response, { type: 'response.output_text.delta', item_id: 'msg-1', delta: ' world' })
       if (state.mode === 'unclosed') {
-        // A provider that completes without closing the opened item.
         send(response, { type: 'response.completed', response: { id: 'resp-1', status: 'completed', output: [{ type: 'message' }] } })
         response.end()
         return
