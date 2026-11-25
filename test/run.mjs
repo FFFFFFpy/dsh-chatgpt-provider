@@ -199,8 +199,9 @@ await test('the settings state omits every token and lists the account models', 
   }
 })
 
-await test('a text request uses instructions, store:false, stream:true, and no rejected fields', async () => {
+await test('a text request leads input with a developer message and omits rejected fields', async () => {
   fake.state.mode = 'ok'
+  fake.state.usageMode = 'legacy'
   const chunks = []
   for await (const chunk of adapter.stream({
     provider: 'chatgpt',
@@ -217,11 +218,14 @@ await test('a text request uses instructions, store:false, stream:true, and no r
   const sent = fake.recordings.responses.at(-1)
   assert.equal(sent.body.store, false)
   assert.equal(sent.body.stream, true)
-  assert.equal(sent.body.instructions, 'You are terse.')
+  // Top-level `instructions` are billed uncached on every request from GPT-6.2
+  // on, so the system prompt must lead `input` instead.
+  assert.equal('instructions' in sent.body, false)
   assert.equal('temperature' in sent.body, false)
   assert.equal('max_output_tokens' in sent.body, false)
-  assert.deepEqual(sent.body.input[0], { role: 'developer', content: 'Runtime context.' })
-  assert.deepEqual(sent.body.input[1], { role: 'user', content: 'hi' })
+  assert.deepEqual(sent.body.input[0], { role: 'developer', content: 'You are terse.' })
+  assert.deepEqual(sent.body.input[1], { role: 'developer', content: 'Runtime context.' })
+  assert.deepEqual(sent.body.input[2], { role: 'user', content: 'hi' })
   assert.match(sent.headers.authorization, /^Bearer at-code$/)
   assert.ok(sent.headers['user-agent'].startsWith('deepseek-harness'))
   assert.ok(sent.headers['user-agent'].includes('(+https://github.com/deepseek-ai/deepseek-harness)'))
@@ -229,8 +233,103 @@ await test('a text request uses instructions, store:false, stream:true, and no r
   assert.deepEqual(chunks[0], { type: 'block-start', index: 0, blockType: 'text' })
   assert.deepEqual(chunks[1], { type: 'text-delta', index: 0, text: 'Hello' })
   assert.deepEqual(chunks[3], { type: 'block-end', index: 0, block: { type: 'text', text: 'Hello world' } })
-  assert.deepEqual(chunks.at(-2), { type: 'usage', usage: { inputTokens: 11, outputTokens: 7, totalTokens: 18, cacheReadTokens: 2, reasoningTokens: 3 } })
+  // 11 input tokens include the 2 cached ones; the harness wants them disjoint.
+  assert.deepEqual(chunks.at(-2), { type: 'usage', usage: { inputTokens: 9, outputTokens: 7, totalTokens: 18, cacheReadTokens: 2, reasoningTokens: 3 } })
   assert.deepEqual(chunks.at(-1), { type: 'finish', reason: { kind: 'stop' } })
+})
+
+/**
+ * Mirror the harness's disjoint-usage validation so a mapping that would hide
+ * the Turn usage row fails here first.
+ * @param {Record<string, any>} usage - adapter-reported usage.
+ * @returns {boolean} whether the accounting is consistent.
+ */
+function usageIsConsistent(usage) {
+  const knownPrompt = usage.inputTokens + (usage.cacheReadTokens ?? 0) + (usage.cacheWriteTokens ?? 0)
+  if (usage.totalTokens === undefined) return usage.cacheReadTokens === undefined ? false : usage.cacheWriteTokens !== undefined
+  const exactPrompt = usage.totalTokens - usage.outputTokens
+  if (exactPrompt < knownPrompt) return false
+  if (usage.cacheReadTokens !== undefined && usage.cacheWriteTokens !== undefined && exactPrompt !== knownPrompt) return false
+  return true
+}
+
+/**
+ * Stream one tiny request and return its usage chunk.
+ * @returns {Promise<Record<string, any>>} reported usage.
+ */
+async function usageOfOneCall() {
+  const chunks = []
+  for await (const chunk of adapter.stream({
+    provider: 'chatgpt',
+    model: 'gpt-test',
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'usage probe' }] }],
+  })) chunks.push(chunk)
+  return chunks.find(chunk => chunk.type === 'usage').usage
+}
+
+await test('a cached read alone is reported as disjoint uncached and cached input', async () => {
+  fake.state.mode = 'ok'
+  fake.state.usageMode = 'legacy'
+  const usage = await usageOfOneCall()
+  assert.equal(usage.inputTokens, 9)
+  assert.equal(usage.cacheReadTokens, 2)
+  assert.equal(usage.cacheWriteTokens, undefined)
+  assert.equal(usageIsConsistent(usage), true)
+})
+
+await test('a model that bills cache writes reports both buckets disjointly', async () => {
+  fake.state.mode = 'ok'
+  fake.state.usageMode = 'writes'
+  const usage = await usageOfOneCall()
+  assert.deepEqual(usage, {
+    inputTokens: 1000,
+    outputTokens: 500,
+    totalTokens: 12500,
+    cacheReadTokens: 4000,
+    cacheWriteTokens: 7000,
+    reasoningTokens: 100,
+  })
+  assert.equal(usageIsConsistent(usage), true)
+})
+
+await test('usage without cache detail leaves both buckets absent', async () => {
+  fake.state.mode = 'ok'
+  fake.state.usageMode = 'uncached'
+  const usage = await usageOfOneCall()
+  assert.deepEqual(usage, { inputTokens: 1000, outputTokens: 20, totalTokens: 1020 })
+  assert.equal(usageIsConsistent(usage), true)
+  fake.state.usageMode = 'legacy'
+})
+
+await test('the route declares in-history system prompt updates so the prefix survives', async () => {
+  const resolved = await adapter.resolveModel('chatgpt', 'gpt-test')
+  assert.equal(resolved.systemPromptUpdate, 'in-history')
+  assert.equal(resolved.toolUpdate, undefined)
+})
+
+await test('a second round repeats the first request prefix byte for byte', async () => {
+  fake.state.mode = 'ok'
+  const history = [
+    { role: 'system', content: [{ type: 'text', text: 'Stable system prompt.' }] },
+    { role: 'user', content: [{ type: 'text', text: 'first question' }] },
+  ]
+  for await (const _chunk of adapter.stream({ provider: 'chatgpt', model: 'gpt-test', messages: history })) { /* round 1 */ }
+  const first = fake.recordings.responses.at(-1).body.input
+
+  const second = [...history,
+    {
+      role: 'assistant',
+      source: { kind: 'model', provider: 'chatgpt', model: 'gpt-test' },
+      content: [{ type: 'text', text: 'first answer' }],
+    },
+    { role: 'user', content: [{ type: 'text', text: 'second question' }] },
+  ]
+  for await (const _chunk of adapter.stream({ provider: 'chatgpt', model: 'gpt-test', messages: second })) { /* round 2 */ }
+  const next = fake.recordings.responses.at(-1).body.input
+
+  assert.ok(next.length > first.length)
+  assert.deepEqual(next.slice(0, first.length), first)
+  assert.deepEqual(fake.recordings.responses.at(-1).body.tools, undefined)
 })
 
 await test('tools are grouped in one namespace and tool rounds replay with it', async () => {

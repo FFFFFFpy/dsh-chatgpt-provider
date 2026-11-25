@@ -24,7 +24,7 @@ Back in the page, the card shows the verified account, whether the grant include
 
 After plan authorization, the composer's model menu lists the account's visible models under **ChatGPT**. When a ChatGPT model is selected, the composer identifies the plan and links to usage settings. Requests stream through `POST /v1/responses`.
 
-The wire is the documented plan-usage shape: `store: false`, `stream: true`, system guidance in `instructions`, functions in the `dsh` tool namespace, images as `input_image` data URLs, and no `temperature`, `max_output_tokens`, `previous_response_id`, or `metadata`. The provider's stream events become harness text, reasoning, and tool-call chunks, so tool rounds, reasoning summaries, and token usage all reach the session.
+The wire is the documented plan-usage shape: `store: false`, `stream: true`, system guidance as a leading `developer` message inside `input`, functions in the `dsh` tool namespace, images as `input_image` data URLs, and no `temperature`, `max_output_tokens`, `previous_response_id`, or `metadata`. The provider's stream events become harness text, reasoning, and tool-call chunks, so tool rounds, reasoning summaries, and token usage all reach the session.
 
 ## Credentials
 

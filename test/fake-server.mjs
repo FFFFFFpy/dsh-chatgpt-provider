@@ -65,6 +65,37 @@ export async function startFakeOpenAI() {
   }
   const recordings = { tokenRequests: [], responses: [], revocations: [], models: 0 }
 
+  /**
+   * Build the provider usage the adapter has to normalize.
+   *
+   * `legacy` reports a cached read only, `writes` reports both buckets the way a
+   * model that bills cache writes does, and `uncached` reports no cache detail
+   * at all. In every case `input_tokens` folds the cache buckets in, as the
+   * Responses API does.
+   * @returns {Record<string, unknown>} response.usage
+   */
+  function usageFor() {
+    if (state.usageMode === 'writes') {
+      return {
+        input_tokens: 12000,
+        output_tokens: 500,
+        total_tokens: 12500,
+        input_tokens_details: { cached_tokens: 4000, cache_write_tokens: 7000 },
+        output_tokens_details: { reasoning_tokens: 100 },
+      }
+    }
+    if (state.usageMode === 'uncached') {
+      return { input_tokens: 1000, output_tokens: 20, total_tokens: 1020 }
+    }
+    return {
+      input_tokens: 11,
+      output_tokens: 7,
+      total_tokens: 18,
+      input_tokens_details: { cached_tokens: 2 },
+      output_tokens_details: { reasoning_tokens: 3 },
+    }
+  }
+
   const server = createServer(async (request, response) => {
     const url = new URL(request.url ?? '/', 'http://127.0.0.1')
     const chunks = []
@@ -209,7 +240,7 @@ export async function startFakeOpenAI() {
             id: 'resp-1',
             status: 'completed',
             output: [{ type: 'function_call', call_id: 'call-1' }],
-            usage: { input_tokens: 11, output_tokens: 7, total_tokens: 18, input_tokens_details: { cached_tokens: 2 }, output_tokens_details: { reasoning_tokens: 3 } },
+            usage: usageFor(),
           },
         })
         response.end()
@@ -236,7 +267,7 @@ export async function startFakeOpenAI() {
           id: 'resp-1',
           status: 'completed',
           output: [{ type: 'message' }],
-          usage: { input_tokens: 11, output_tokens: 7, total_tokens: 18, input_tokens_details: { cached_tokens: 2 }, output_tokens_details: { reasoning_tokens: 3 } },
+          usage: usageFor(),
         },
       })
       response.end()
@@ -257,3 +288,4 @@ export async function startFakeOpenAI() {
     close: () => new Promise(resolve => server.close(resolve)),
   }
 }
+

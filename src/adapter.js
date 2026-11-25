@@ -205,6 +205,10 @@ export class ChatGptAdapter {
       name: resolved.name,
       context: { contextWindow: resolved.contextWindow },
       inputModalities: this.#inputModalities(model),
+      // The route reads a later developer message as the effective instructions,
+      // so the harness appends prompt updates after the cached history instead of
+      // replaying the whole prompt: the request prefix stays intact.
+      systemPromptUpdate: 'in-history',
       ...efforts.length === 0 ? {} : { reasoning: { efforts: efforts.map(effort) } },
     }
   }

@@ -82,7 +82,9 @@ node test/routes.test.mjs   # the settings API envelope and configuration normal
 
 ## Message contract
 
-- System guidance travels in `instructions`.
+- System guidance leads `input` as a `developer` message. The top-level `instructions` field is never sent: from GPT-6.2 on it is appended after `input`, outside every eligible cache prefix, and billed as uncached input on every request.
+- The route declares `systemPromptUpdate: 'in-history'`, so the harness appends prompt updates after the cached history instead of rewriting the first system node.
+- Usage buckets are disjoint: `input_tokens` folds in cached reads and cache writes, so the adapter subtracts both back out and reports `cacheReadTokens` / `cacheWriteTokens` only when the model provides them.
 - History `system`/`developer` messages become `developer` items.
 - Tools are declared in the `dsh` namespace. Assistant calls and tool results replay with that namespace and their original call IDs. Tool results can contain both text and images.
 - Images are projected through the attachment service into `input_image` data URLs; files contribute the harness's deterministic file handle text.

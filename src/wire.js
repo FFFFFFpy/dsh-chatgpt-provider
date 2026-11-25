@@ -4,9 +4,11 @@
  * harness chunks.
  *
  * The route has documented requirements that shape everything here: send
- * `store: false` and `stream: true`, put system guidance in `instructions` or
- * developer messages (never a `system` role item), and omit `temperature`,
- * `top_p`, `max_output_tokens`, `metadata`, `truncation`, `user`, and
+ * `store: false` and `stream: true`, carry system guidance as a leading
+ * developer message inside `input` (never a `system` role item, and never the
+ * top-level `instructions` field, which is appended after `input` from GPT-6.2
+ * on and always billed as uncached input), and omit `temperature`, `top_p`,
+ * `max_output_tokens`, `metadata`, `truncation`, `user`, and
  * `previous_response_id`.
  */
 import { ChatGptError, CODES, apiError, toLlmError } from './errors.js'
@@ -131,13 +133,17 @@ export async function toInput(messages, projectors) {
  */
 export async function buildBody({ model, messages, system, tools, reasoningEffort }, projectors) {
   const input = await toInput(messages, projectors)
+  // Reusable system guidance has to lead `input` as a developer message. From
+  // GPT-6.2 on, top-level `instructions` are appended after `input`, beyond the
+  // eligible cache prefix, and are billed as uncached input on every request
+  // even when the text repeats — so they can never be served from cache.
+  if (typeof system === 'string' && system !== '') input.unshift({ role: 'developer', content: system })
   const body = {
     model,
     input,
     store: false,
     stream: true,
   }
-  if (typeof system === 'string' && system !== '') body.instructions = system
   if (Array.isArray(tools) && tools.length > 0) {
     body.tools = [{
       type: 'namespace', name: TOOL_NAMESPACE, description: 'DeepSeek Harness tools.',
@@ -351,11 +357,21 @@ export async function* translate(response, { onEvent, signal } = {}) {
       const responseValue = event.response ?? {}
       const reported = responseValue.usage
       if (reported !== null && typeof reported === 'object') {
+        const details = reported.input_tokens_details ?? {}
+        // `input_tokens` folds ordinary input, cached reads, and cache writes
+        // together; the harness contract wants the three buckets disjoint.
+        // `cache_write_tokens` exists from the models that bill writes, so an
+        // older model simply reports no write bucket.
+        const cached = Number.isFinite(details.cached_tokens) ? Number(details.cached_tokens) : undefined
+        const written = Number.isFinite(details.cache_write_tokens) ? Number(details.cache_write_tokens) : undefined
+        const reportedInput = Number(reported.input_tokens)
+        const rawInput = Number.isFinite(reportedInput) ? reportedInput : 0
         usage = {
-          inputTokens: Number(reported.input_tokens) || 0,
+          inputTokens: Math.max(0, rawInput - (cached ?? 0) - (written ?? 0)),
           outputTokens: Number(reported.output_tokens) || 0,
           ...Number.isFinite(reported.total_tokens) ? { totalTokens: Number(reported.total_tokens) } : {},
-          ...Number.isFinite(reported.input_tokens_details?.cached_tokens) ? { cacheReadTokens: Number(reported.input_tokens_details.cached_tokens) } : {},
+          ...cached === undefined ? {} : { cacheReadTokens: cached },
+          ...written === undefined ? {} : { cacheWriteTokens: written },
           ...Number.isFinite(reported.output_tokens_details?.reasoning_tokens) ? { reasoningTokens: Number(reported.output_tokens_details.reasoning_tokens) } : {},
         }
       }
