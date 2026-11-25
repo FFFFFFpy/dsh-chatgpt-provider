@@ -242,6 +242,8 @@ export class ChatGptAdapter {
         system: options.system,
         tools: options.tools,
         reasoningEffort: options.reasoningEffort === undefined ? undefined : String(options.reasoningEffort),
+        sessionId: options.sessionId,
+        cacheKey: this.config.promptCacheKey !== false,
       }, {
         imagePart: block => this.#imagePart(block, model, options.signal),
         fileText: block => this.#fileText(block),

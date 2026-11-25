@@ -11,6 +11,7 @@
  * `max_output_tokens`, `metadata`, `truncation`, `user`, and
  * `previous_response_id`.
  */
+import { createHash } from 'node:crypto'
 import { ChatGptError, CODES, apiError, toLlmError } from './errors.js'
 
 const TOOL_NAMESPACE = 'dsh'
@@ -121,6 +122,42 @@ export async function toInput(messages, projectors) {
 }
 
 /**
+ * Derive the cache-routing key one request carries.
+ *
+ * The key does not change the prompt; it keeps a conversation's requests on the
+ * same cache population. Without it the plan route load-balances each request
+ * across machines with different cached prefixes, so an identical prefix hits
+ * one machine at ~95% and another at 0%. A session id is the natural scope; a
+ * caller without one gets a key derived from the stable head of its prompt.
+ *
+ * @param {object} request - key inputs.
+ * @param {unknown} [request.sessionId] - the harness session this request serves.
+ * @param {readonly any[]} [request.messages] - request history.
+ * @param {string} [request.system] - assembled system prompt.
+ * @returns {string} a stable, short cache-routing key.
+ */
+export function derivePromptCacheKey({ sessionId, messages, system }) {
+  if (typeof sessionId === 'string' && sessionId !== '') {
+    const key = `dsh:${sessionId}`
+    // Provider keys are short strings; a branded session id is already short.
+    return key.length <= 64 ? key : `dsh:${createHash('sha256').update(key).digest('hex').slice(0, 40)}`
+  }
+  let leadingSystem = ''
+  let leadingUser = ''
+  for (const message of Array.isArray(messages) ? messages : []) {
+    if (message === null || typeof message !== 'object') continue
+    const text = joinText(message.content)
+    if (leadingSystem === '' && (message.role === 'system' || message.role === 'developer')) leadingSystem = text
+    if (leadingUser === '' && message.role === 'user') leadingUser = text
+    if (leadingSystem !== '' && leadingUser !== '') break
+  }
+  const digest = createHash('sha256')
+    .update(`${typeof system === 'string' ? system : ''}\u0000${leadingSystem}\u0000${leadingUser}`)
+    .digest('hex')
+  return `dsh:p:${digest.slice(0, 32)}`
+}
+
+/**
  * Build the JSON body for one Responses call.
  * @param {object} request - request fields.
  * @param {string} request.model - model id.
@@ -128,10 +165,12 @@ export async function toInput(messages, projectors) {
  * @param {string} [request.system] - assembled system prompt.
  * @param {readonly any[]} [request.tools] - active tool schemas.
  * @param {string} [request.reasoningEffort] - selected effort id.
+ * @param {unknown} [request.sessionId] - serving harness session, for cache routing.
+ * @param {boolean} [request.cacheKey] - whether to send `prompt_cache_key`.
  * @param {object} projectors - content projections.
  * @returns {Promise<Record<string, unknown>>} request body.
  */
-export async function buildBody({ model, messages, system, tools, reasoningEffort }, projectors) {
+export async function buildBody({ model, messages, system, tools, reasoningEffort, sessionId, cacheKey = true }, projectors) {
   const input = await toInput(messages, projectors)
   // Reusable system guidance has to lead `input` as a developer message. From
   // GPT-6.2 on, top-level `instructions` are appended after `input`, beyond the
@@ -144,6 +183,7 @@ export async function buildBody({ model, messages, system, tools, reasoningEffor
     store: false,
     stream: true,
   }
+  if (cacheKey) body.prompt_cache_key = derivePromptCacheKey({ sessionId, messages, system })
   if (Array.isArray(tools) && tools.length > 0) {
     body.tools = [{
       type: 'namespace', name: TOOL_NAMESPACE, description: 'DeepSeek Harness tools.',

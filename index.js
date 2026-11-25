@@ -39,6 +39,7 @@ const DEFAULTS = Object.freeze({
   modelCacheSeconds: 600,
   requestTimeoutMs: 180000,
   signInTimeoutMs: 300000,
+  promptCacheKey: true,
   trace: false,
 })
 
@@ -133,6 +134,7 @@ export function resolveConfig(raw) {
     modelCacheSeconds: count(input.modelCacheSeconds, DEFAULTS.modelCacheSeconds),
     requestTimeoutMs: count(input.requestTimeoutMs, DEFAULTS.requestTimeoutMs),
     signInTimeoutMs: count(input.signInTimeoutMs, DEFAULTS.signInTimeoutMs),
+    promptCacheKey: input.promptCacheKey !== false,
     trace: input.trace === true,
   }
 }

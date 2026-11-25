@@ -330,6 +330,45 @@ await test('a second round repeats the first request prefix byte for byte', asyn
   assert.ok(next.length > first.length)
   assert.deepEqual(next.slice(0, first.length), first)
   assert.deepEqual(fake.recordings.responses.at(-1).body.tools, undefined)
+  // The cache key must be identical across rounds, or the route cannot keep the
+  // conversation on one cache population.
+  const firstKey = fake.recordings.responses.at(-2).body.prompt_cache_key
+  const nextKey = fake.recordings.responses.at(-1).body.prompt_cache_key
+  assert.match(firstKey, /^dsh:p:[0-9a-f]{32}$/)
+  assert.equal(nextKey, firstKey)
+})
+
+await test('a session id scopes the cache key and stays stable per session', async () => {
+  fake.state.mode = 'ok'
+  const messages = [{ role: 'user', content: [{ type: 'text', text: 'same prompt' }] }]
+  for await (const _chunk of adapter.stream({ provider: 'chatgpt', model: 'gpt-test', messages, sessionId: 'session-abc' })) { /* case a */ }
+  assert.equal(fake.recordings.responses.at(-1).body.prompt_cache_key, 'dsh:session-abc')
+  for await (const _chunk of adapter.stream({ provider: 'chatgpt', model: 'gpt-test', messages, sessionId: 'session-abc' })) { /* case b */ }
+  assert.equal(fake.recordings.responses.at(-1).body.prompt_cache_key, 'dsh:session-abc')
+  for await (const _chunk of adapter.stream({ provider: 'chatgpt', model: 'gpt-test', messages, sessionId: 'session-xyz' })) { /* case c */ }
+  assert.equal(fake.recordings.responses.at(-1).body.prompt_cache_key, 'dsh:session-xyz')
+})
+
+await test('without a session id the key follows the stable prompt head', async () => {
+  fake.state.mode = 'ok'
+  const run = async content => {
+    for await (const _chunk of adapter.stream({
+      provider: 'chatgpt', model: 'gpt-test', messages: [{ role: 'user', content: [{ type: 'text', text: content }] }],
+    })) { /* one round */ }
+    return fake.recordings.responses.at(-1).body.prompt_cache_key
+  }
+  const first = await run('first prompt')
+  assert.equal(await run('first prompt'), first)
+  assert.notEqual(await run('different prompt'), first)
+})
+
+await test('the cache key can be turned off for a route that rejects it', async () => {
+  fake.state.mode = 'ok'
+  const noKey = new ChatGptAdapter({ session, config: { ...config, promptCacheKey: false }, ctx, logger })
+  for await (const _chunk of noKey.stream({
+    provider: 'chatgpt', model: 'gpt-test', messages: [{ role: 'user', content: [{ type: 'text', text: 'x' }] }], sessionId: 'session-abc',
+  })) { /* drain */ }
+  assert.equal('prompt_cache_key' in fake.recordings.responses.at(-1).body, false)
 })
 
 await test('tools are grouped in one namespace and tool rounds replay with it', async () => {
