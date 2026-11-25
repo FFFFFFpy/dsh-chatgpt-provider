@@ -26,7 +26,7 @@ After plan authorization, the composer's model menu lists the account's visible 
 
 The wire is the documented plan-usage shape: `store: false`, `stream: true`, system guidance as a leading `developer` message inside `input`, functions in the `dsh` tool namespace, images as `input_image` data URLs, and no `temperature`, `max_output_tokens`, `previous_response_id`, or `metadata`. The provider's stream events become harness text, reasoning, and tool-call chunks, so tool rounds, reasoning summaries, and token usage all reach the session.
 
-Each request also carries a `prompt_cache_key` scoped to the session (`dsh:<sessionId>`). It does not change the prompt; it keeps one conversation's requests on the same cache population, which the plan route otherwise load-balances across machines whose cached prefixes differ. Token usage is reported in the harness's disjoint buckets, so the cache-hit share and the cache-write bucket are exact rather than derived from a folded prompt total.
+Each request also carries a `prompt_cache_key` scoped to the session (`dsh:<sessionId>`), and the same conversation id as a `session_id` / `session-id` request header. The body key alone does not make the route sticky: the plan backend derives cache affinity from the session header, and reuses a server-issued `x-codex-turn-state` when one comes back, so a conversation stops bouncing between machines that hold different cached prefixes. Token usage is reported in the harness's disjoint buckets, so the cache-hit share and the cache-write bucket are exact rather than derived from a folded prompt total.
 
 ## Credentials
 

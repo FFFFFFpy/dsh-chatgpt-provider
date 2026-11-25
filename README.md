@@ -47,6 +47,7 @@ Every field is optional. The row is `chatgpt-provider` in the profile's `cordis.
 | `requestTimeoutMs` | `180000` | Deadline for one Responses request, including the streamed body |
 | `signInTimeoutMs` | `300000` | How long a started sign-in waits for the browser |
 | `promptCacheKey` | `true` | Send a session-scoped `prompt_cache_key` so one conversation keeps reaching the same cache population |
+| `sessionAffinity` | `both` | Session-affinity request header spelling: `both`, `session_id`, `session-id`, or `none` |
 | `trace` | `false` | Log every Responses stream event type at debug level |
 
 ```yaml
@@ -87,6 +88,7 @@ node test/routes.test.mjs   # the settings API envelope and configuration normal
 - The route declares `systemPromptUpdate: 'in-history'`, so the harness appends prompt updates after the cached history instead of rewriting the first system node.
 - Usage buckets are disjoint: `input_tokens` folds in cached reads and cache writes, so the adapter subtracts both back out and reports `cacheReadTokens` / `cacheWriteTokens` only when the model provides them.
 - Every request carries `prompt_cache_key`. With a session it is `dsh:<sessionId>`; a caller without one gets a key derived from the stable head of its prompt. The key does not alter the prompt — it keeps a conversation's requests on one cache population, because without it the plan route balances requests across machines holding different cached prefixes (an identical prefix then reads at 95% on one machine and 0% on another). Set `promptCacheKey: false` on a route that rejects the field.
+- The body key alone does not make the route sticky, so each request also sends the conversation id as a `session_id` / `session-id` request header (`sessionAffinity`), and replays any `x-codex-turn-state` the server returns for that conversation. A rejected turn state is forgotten and the request retried once without it.
 - History `system`/`developer` messages become `developer` items.
 - Tools are declared in the `dsh` namespace. Assistant calls and tool results replay with that namespace and their original call IDs. Tool results can contain both text and images.
 - Images are projected through the attachment service into `input_image` data URLs; files contribute the harness's deterministic file handle text.

@@ -17,7 +17,7 @@ import { readFileSync } from 'node:fs'
 import path from 'node:path'
 import { PROVIDER } from './constants.js'
 import { ChatGptError, CODES, LlmRequestError, apiError, toLlmError } from './errors.js'
-import { buildBody, translate } from './wire.js'
+import { buildBody, derivePromptCacheKey, translate } from './wire.js'
 
 /** Human labels for effort ids the provider may advertise. */
 const EFFORT_LABELS = {
@@ -76,6 +76,42 @@ export class ChatGptAdapter {
     this.ctx = ctx
     this.logger = logger
     this.attribution = { 'user-agent': userAgent() }
+    /** Per-conversation `x-codex-turn-state`, the server's sticky-routing token. */
+    this.turnStates = new Map()
+  }
+
+  /**
+   * Build the session-affinity headers the plan route routes on.
+   *
+   * The request-body `prompt_cache_key` does not make the route sticky: the
+   * backend derives cache affinity from a session header, so an identical
+   * prefix lands on a machine with the conversation cached, or on one with
+   * nothing. Both spellings are sent because gateways differ on the separator.
+   *
+   * @param {string} id - stable conversation identifier, or empty when unknown.
+   * @returns {Record<string, string>} headers to merge into the request.
+   */
+  #affinityHeaders(id) {
+    const mode = this.config.sessionAffinity ?? 'both'
+    if (mode === 'none' || id === '') return {}
+    const headers = {}
+    if (mode === 'both' || mode === 'session_id') headers.session_id = id
+    if (mode === 'both' || mode === 'session-id') headers['session-id'] = id
+    return headers
+  }
+
+  /**
+   * Remember the server's sticky token, keeping the cache bounded.
+   * @param {string} key - conversation key.
+   * @param {string} value - token from the response headers.
+   * @returns {void}
+   */
+  #rememberTurnState(key, value) {
+    if (this.turnStates.size >= 256 && !this.turnStates.has(key)) {
+      const oldest = this.turnStates.keys().next().value
+      if (oldest !== undefined) this.turnStates.delete(oldest)
+    }
+    this.turnStates.set(key, value)
   }
 
   /**
@@ -234,6 +270,13 @@ export class ChatGptAdapter {
       throw new LlmRequestError('ChatGPT plan usage does not accept stop sequences on this route', 'UNSUPPORTED_OPTION')
     }
     const model = options.model
+    const sessionId = typeof options.sessionId === 'string' && options.sessionId !== '' ? options.sessionId : undefined
+    const cacheKey = this.config.promptCacheKey === false
+      ? undefined
+      : derivePromptCacheKey({ sessionId, messages: options.messages, system: options.system })
+    // The conversation the affinity headers identify: the harness session when
+    // there is one, otherwise the same stable digest the body key carries.
+    const conversation = sessionId ?? cacheKey ?? ''
     let body
     try {
       body = await buildBody({
@@ -242,8 +285,7 @@ export class ChatGptAdapter {
         system: options.system,
         tools: options.tools,
         reasoningEffort: options.reasoningEffort === undefined ? undefined : String(options.reasoningEffort),
-        sessionId: options.sessionId,
-        cacheKey: this.config.promptCacheKey !== false,
+        promptCacheKey: cacheKey,
       }, {
         imagePart: block => this.#imagePart(block, model, options.signal),
         fileText: block => this.#fileText(block),
@@ -257,29 +299,53 @@ export class ChatGptAdapter {
     // outlive the configured bound.
     const deadline = AbortSignal.timeout(this.config.requestTimeoutMs)
     const signal = options.signal === undefined ? deadline : AbortSignal.any([options.signal, deadline])
+    const url = `${this.config.apiBaseURL}/responses`
+    const affinity = this.#affinityHeaders(conversation)
+    const turnStateKey = conversation === '' ? 'anonymous' : conversation
+    const cachedTurnState = conversation === '' ? undefined : this.turnStates.get(turnStateKey)
+    const send = extra => this.session.authorizedFetch(url, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'text/event-stream',
+        ...this.attribution,
+        ...affinity,
+        ...extra,
+      },
+      body: JSON.stringify(body),
+    }, signal)
+    const asError = text => {
+      try {
+        return JSON.parse(text)
+      } catch {
+        return text.slice(0, 400)
+      }
+    }
     let response
     try {
-      response = await this.session.authorizedFetch(`${this.config.apiBaseURL}/responses`, {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          accept: 'text/event-stream',
-          ...this.attribution,
-        },
-        body: JSON.stringify(body),
-      }, signal)
+      response = await send(cachedTurnState === undefined ? {} : { 'x-codex-turn-state': cachedTurnState })
     } catch (error) {
       throw toLlmError(error)
     }
     if (!response.ok) {
-      const text = await response.text().catch(() => '')
-      let parsed
-      try {
-        parsed = JSON.parse(text)
-      } catch {
-        parsed = text.slice(0, 400)
+      let text = await response.text().catch(() => '')
+      // A rejected sticky token is recoverable: forget it and retry once.
+      if (cachedTurnState !== undefined && /turn[_-]?state/i.test(text)) {
+        this.turnStates.delete(turnStateKey)
+        this.logger?.warn?.('chatgpt: the cached turn state was rejected; retrying without it')
+        try {
+          response = await send({})
+        } catch (error) {
+          throw toLlmError(error)
+        }
+        if (!response.ok) text = await response.text().catch(() => '')
       }
-      throw toLlmError(apiError(parsed, response.status, response.headers.get('x-request-id')))
+      if (!response.ok) throw toLlmError(apiError(asError(text), response.status, response.headers.get('x-request-id')))
+    }
+    const turnState = response.headers.get('x-codex-turn-state')
+    if (turnState !== null && turnState !== '' && conversation !== '') this.#rememberTurnState(turnStateKey, turnState)
+    if (this.config.trace === true) {
+      this.logger?.debug?.(`chatgpt: request key=${cacheKey ?? 'none'} affinity=${Object.keys(affinity).join(',') || 'none'} turn-state=${cachedTurnState === undefined ? 'none' : 'sent'}${turnState === null ? '' : ' received'}`)
     }
     try {
       yield* translate(response, {

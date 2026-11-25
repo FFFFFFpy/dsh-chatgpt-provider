@@ -62,6 +62,12 @@ export async function startFakeOpenAI() {
     earliestRefreshAt: undefined,
     refreshFails: false,
     refreshIdToken: true,
+    /** Provider usage shape: 'legacy' | 'writes' | 'uncached'. */
+    usageMode: 'legacy',
+    /** Value returned in `x-codex-turn-state`, or undefined for none. */
+    turnState: undefined,
+    /** Refuse any request that replays a sticky token, to exercise the recovery path. */
+    rejectTurnState: false,
   }
   const recordings = { tokenRequests: [], responses: [], revocations: [], models: 0 }
 
@@ -195,6 +201,11 @@ export async function startFakeOpenAI() {
     if (url.pathname === '/v1/responses' && request.method === 'POST') {
       const body = JSON.parse(raw === '' ? '{}' : raw)
       recordings.responses.push({ body, headers: request.headers })
+      if (state.rejectTurnState === true && request.headers['x-codex-turn-state'] !== undefined) {
+        response.writeHead(400, { 'content-type': 'application/json' })
+        response.end(JSON.stringify({ error: { code: 'invalid_turn_state', message: 'Unknown x-codex-turn-state.' } }))
+        return
+      }
       if (state.mode === 'quota') {
         response.writeHead(429, { 'content-type': 'application/json' })
         response.end(JSON.stringify({ error: { code: 'subscription_sharing_usage_limit_exceeded', message: 'Usage limit reached.', type: 'invalid_request_error' } }))
@@ -205,7 +216,11 @@ export async function startFakeOpenAI() {
         response.end(JSON.stringify({ error: { code: 'subscription_sharing_user_not_eligible', message: 'Not eligible.' } }))
         return
       }
-      response.writeHead(200, { 'content-type': 'text/event-stream', 'x-request-id': 'req-test' })
+      response.writeHead(200, {
+        'content-type': 'text/event-stream',
+        'x-request-id': 'req-test',
+        ...typeof state.turnState === 'string' && state.turnState !== '' ? { 'x-codex-turn-state': state.turnState } : {},
+      })
       send(response, { type: 'response.created', response: { id: 'resp-1' } })
       if (state.mode === 'fail') {
         send(response, { type: 'response.failed', response: { error: { code: 'subscription_sharing_unsupported_capability', message: 'Unsupported input.', param: 'tools' } } })

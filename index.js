@@ -40,6 +40,7 @@ const DEFAULTS = Object.freeze({
   requestTimeoutMs: 180000,
   signInTimeoutMs: 300000,
   promptCacheKey: true,
+  sessionAffinity: 'both',
   trace: false,
 })
 
@@ -112,6 +113,15 @@ function modelCatalog(value) {
 }
 
 /**
+ * Accept a session-affinity header mode.
+ * @param {unknown} value - candidate.
+ * @returns {'both' | 'session_id' | 'session-id' | 'none'} the accepted mode.
+ */
+function affinityMode(value) {
+  return value === 'session_id' || value === 'session-id' || value === 'none' ? value : 'both'
+}
+
+/**
  * Normalize the row's configuration.
  * @param {unknown} raw - loader-provided configuration.
  * @returns {Record<string, any>} resolved configuration.
@@ -135,6 +145,7 @@ export function resolveConfig(raw) {
     requestTimeoutMs: count(input.requestTimeoutMs, DEFAULTS.requestTimeoutMs),
     signInTimeoutMs: count(input.signInTimeoutMs, DEFAULTS.signInTimeoutMs),
     promptCacheKey: input.promptCacheKey !== false,
+    sessionAffinity: affinityMode(input.sessionAffinity),
     trace: input.trace === true,
   }
 }
@@ -207,5 +218,5 @@ export function apply(ctx, rawConfig) {
     })
   })
 
-  logger?.info?.(`chatgpt-provider: ready (provider "${PROVIDER}", settings ${API_PREFIX})`)
+  logger?.info?.(`chatgpt-provider: ready (provider "${PROVIDER}", settings ${API_PREFIX}, cache key ${config.promptCacheKey ? 'on' : 'off'}, affinity ${config.sessionAffinity})`)
 }

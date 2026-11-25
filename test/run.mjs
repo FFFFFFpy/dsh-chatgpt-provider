@@ -371,6 +371,76 @@ await test('the cache key can be turned off for a route that rejects it', async 
   assert.equal('prompt_cache_key' in fake.recordings.responses.at(-1).body, false)
 })
 
+/**
+ * Stream one probe request and return the headers it was sent with.
+ * @param {Record<string, any>} options - extra stream options.
+ * @param {import('../src/adapter.js').ChatGptAdapter} [target] - adapter to use.
+ * @returns {Promise<Record<string, any>>} request headers.
+ */
+async function probeHeaders(options, target = adapter) {
+  for await (const _chunk of target.stream({
+    provider: 'chatgpt',
+    model: 'gpt-test',
+    messages: [{ role: 'user', content: [{ type: 'text', text: options.text ?? 'affinity probe' }] }],
+    ...options,
+  })) { /* drain */ }
+  return fake.recordings.responses.at(-1).headers
+}
+
+await test('session affinity headers carry the session id in both spellings', async () => {
+  fake.state.mode = 'ok'
+  const headers = await probeHeaders({ sessionId: 'session-affinity' })
+  assert.equal(headers.session_id, 'session-affinity')
+  assert.equal(headers['session-id'], 'session-affinity')
+})
+
+await test('a caller without a session id sends the derived key as its affinity id', async () => {
+  const headers = await probeHeaders({ text: 'no session here' })
+  assert.match(headers.session_id, /^dsh:p:[0-9a-f]{32}$/)
+  assert.equal(headers.session_id, headers['session-id'])
+})
+
+await test('the server turn state is captured and replayed on the next request', async () => {
+  fake.state.mode = 'ok'
+  fake.state.turnState = 'ts-1'
+  const first = await probeHeaders({ sessionId: 'session-turnstate' })
+  assert.equal(first['x-codex-turn-state'], undefined)
+  const second = await probeHeaders({ sessionId: 'session-turnstate' })
+  assert.equal(second['x-codex-turn-state'], 'ts-1')
+  fake.state.turnState = undefined
+})
+
+await test('a rejected turn state is forgotten and the request retried once', async () => {
+  fake.state.mode = 'ok'
+  fake.state.turnState = 'ts-stale'
+  await probeHeaders({ sessionId: 'session-retry' })
+  fake.state.turnState = undefined
+  fake.state.rejectTurnState = true
+  const before = fake.recordings.responses.length
+  const headers = await probeHeaders({ sessionId: 'session-retry' })
+  assert.equal(fake.recordings.responses.length, before + 2)
+  assert.equal(fake.recordings.responses[before].headers['x-codex-turn-state'], 'ts-stale')
+  assert.equal(fake.recordings.responses[before + 1].headers['x-codex-turn-state'], undefined)
+  assert.equal(headers['x-codex-turn-state'], undefined)
+  fake.state.rejectTurnState = false
+})
+
+await test('the affinity header spelling is configurable or can be turned off', async () => {
+  fake.state.mode = 'ok'
+  const hyphen = new ChatGptAdapter({ session, config: { ...config, sessionAffinity: 'session-id' }, ctx, logger })
+  const hyphenHeaders = await probeHeaders({ sessionId: 'session-spelling' }, hyphen)
+  assert.equal(hyphenHeaders['session-id'], 'session-spelling')
+  assert.equal(hyphenHeaders.session_id, undefined)
+  const underscore = new ChatGptAdapter({ session, config: { ...config, sessionAffinity: 'session_id' }, ctx, logger })
+  const underscoreHeaders = await probeHeaders({ sessionId: 'session-spelling' }, underscore)
+  assert.equal(underscoreHeaders.session_id, 'session-spelling')
+  assert.equal(underscoreHeaders['session-id'], undefined)
+  const off = new ChatGptAdapter({ session, config: { ...config, sessionAffinity: 'none' }, ctx, logger })
+  const offHeaders = await probeHeaders({ sessionId: 'session-spelling' }, off)
+  assert.equal(offHeaders.session_id, undefined)
+  assert.equal(offHeaders['session-id'], undefined)
+})
+
 await test('tools are grouped in one namespace and tool rounds replay with it', async () => {
   fake.state.mode = 'tool'
   const chunks = []

@@ -166,11 +166,11 @@ export function derivePromptCacheKey({ sessionId, messages, system }) {
  * @param {readonly any[]} [request.tools] - active tool schemas.
  * @param {string} [request.reasoningEffort] - selected effort id.
  * @param {unknown} [request.sessionId] - serving harness session, for cache routing.
- * @param {boolean} [request.cacheKey] - whether to send `prompt_cache_key`.
+ * @param {string} [request.promptCacheKey] - cache-routing key to send, when the adapter computed one.
  * @param {object} projectors - content projections.
  * @returns {Promise<Record<string, unknown>>} request body.
  */
-export async function buildBody({ model, messages, system, tools, reasoningEffort, sessionId, cacheKey = true }, projectors) {
+export async function buildBody({ model, messages, system, tools, reasoningEffort, promptCacheKey }, projectors) {
   const input = await toInput(messages, projectors)
   // Reusable system guidance has to lead `input` as a developer message. From
   // GPT-6.2 on, top-level `instructions` are appended after `input`, beyond the
@@ -183,7 +183,7 @@ export async function buildBody({ model, messages, system, tools, reasoningEffor
     store: false,
     stream: true,
   }
-  if (cacheKey) body.prompt_cache_key = derivePromptCacheKey({ sessionId, messages, system })
+  if (typeof promptCacheKey === 'string' && promptCacheKey !== '') body.prompt_cache_key = promptCacheKey
   if (Array.isArray(tools) && tools.length > 0) {
     body.tools = [{
       type: 'namespace', name: TOOL_NAMESPACE, description: 'DeepSeek Harness tools.',
